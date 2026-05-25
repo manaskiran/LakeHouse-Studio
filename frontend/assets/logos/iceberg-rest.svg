@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Iceberg REST Catalog mark — distinct from the table-format mark so
+  the two components aren't visually duplicated in the cart.
+  Original geometric design (database/catalog cylinder + REST label)
+  in the Iceberg brand blue palette to preserve family resemblance.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" aria-label="Iceberg REST Catalog">
+  <defs>
+    <linearGradient id="ibrest_g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4ECAEB"/>
+      <stop offset="100%" stop-color="#1F70A8"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="32" cy="14" rx="20" ry="6" fill="url(#ibrest_g)"/>
+  <path d="M12 14 V46 a20 6 0 0 0 40 0 V14" fill="url(#ibrest_g)" opacity="0.92"/>
+  <ellipse cx="32" cy="14" rx="20" ry="6" fill="none" stroke="#0E3B5C" stroke-width="1.2" opacity="0.4"/>
+  <ellipse cx="32" cy="30" rx="20" ry="6" fill="none" stroke="#0E3B5C" stroke-width="1" opacity="0.35"/>
+  <g transform="translate(20,52)">
+    <rect x="0" y="0" width="24" height="11" rx="2.5" fill="#0E3B5C"/>
+    <text x="12" y="8.2" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"
+          font-size="7" font-weight="700" fill="#fff" text-anchor="middle"
+          letter-spacing="0.5">REST</text>
+  </g>
+</svg>

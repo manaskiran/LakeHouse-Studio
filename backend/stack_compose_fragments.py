@@ -1,0 +1,700 @@
+"""v0.6.1 — per-stack docker-compose fragment writers.
+
+PURE ADDITIVE MODULE. Same atomic-write + external-network shape as
+`airflow_overlay.py`, but with a critical contract difference:
+
+  * Airflow / Dagster / Superset overlays are OPT-IN operational
+    extras gated by `LHS_*_ENABLED` env flags. They never run by
+    default.
+  * Stack compose fragments here are REQUIRED to make the four
+    `candidate` stacks installable at all. UDP's upstream
+    docker-compose.yml does NOT ship a `nessie`, `polaris`,
+    `hive-metastore`, or `postgres-hms` service definition, so each
+    of those stacks would fail at the `docker compose up` step.
+
+The runner calls `write_fragment(stack_id, install_dir, env)` from
+`_step_env` after `_write_optional_overlays`. The writer returns either
+a `Path` (fragment written) or `None` (no fragment needed — the stable
+`udp-local-v0.2` stack hits this branch). When a path is returned, the
+runner prepends an entry into `self._overlays` so the docker_compose_up
+argv injects `-f docker-compose.fragment.yml` BEFORE any opt-in overlays
+(so the fragment's services are visible to anything that depends on them).
+
+Each render function returns the YAML body as a string. `write_fragment`
+is responsible for writing it atomically to disk. This keeps the render
+functions trivially unit-testable without touching the filesystem.
+
+All services attach to the base stack's docker network via an `external:
+true` declaration, exactly like `airflow_overlay.py`. Without this they
+would land on a second network and couldn't talk to MinIO (or each other)
+by service name.
+
+Image tags pinned 2026-05-17 — matched against the manifests in
+`stacks/iceberg-nessie-trino-local-v0.1.yaml`,
+`stacks/hudi-hms-spark-local-v0.1.yaml`,
+`stacks/delta-hms-spark-trino-local-v0.1.yaml`, and
+`stacks/iceberg-polaris-spark-local-v0.1.yaml`.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Callable, Optional
+
+
+log = logging.getLogger("lhs.stack_compose_fragments")
+
+
+# ---- pinned image tags (verified 2026-05-17 against stack manifests) ----
+_NESSIE_IMAGE = "ghcr.io/projectnessie/nessie:0.99.0"
+_HMS_IMAGE = "bitsondatadev/hive-metastore:latest"
+_POLARIS_IMAGE = "apache/polaris:1.4.1"  # bumped from 1.0.1 — that tag never published; 1.4.1 is real + has CVE fixes (Gemini research 2026-05-17, verified via docker manifest inspect)
+_POSTGRES_IMAGE = "postgres:15-alpine"
+_MYSQL_IMAGE = "mysql:8.0"
+# Trino 475 verified via `docker manifest inspect trinodb/trino:475`
+# on 2026-05-16. Matches the stack manifests' pin for udp-trino,
+# iceberg-nessie-trino, and delta-hms-spark-trino.
+_TRINO_IMAGE = "trinodb/trino:475"
+
+
+# Filename the runner injects with `-f` when a fragment is needed.
+# Exported so runner.py and tests can import it without parsing.
+FRAGMENT_FILENAME = "docker-compose.fragment.yml"
+
+
+# Service names each fragment adds. The runner appends these to the
+# explicit `docker compose up -d <services>` argv so the fragment's
+# services come up alongside the base stack's services rather than
+# being filtered out by the runner's per-cart service list.
+FRAGMENT_SERVICES: dict[str, list[str]] = {
+    "udp-trino-local-v0.1":              ["trino"],
+    "iceberg-nessie-trino-local-v0.1":  ["nessie", "trino"],
+    "hudi-hms-spark-local-v0.1":        ["mysql-hms", "hive-metastore"],
+    "delta-hms-spark-trino-local-v0.1": ["mysql-hms", "hive-metastore", "trino"],
+    "iceberg-polaris-spark-local-v0.1": ["postgres-polaris", "polaris"],
+}
+
+
+# Named volumes for DB-backing service data, kept distinct per stack so
+# `docker volume rm` is targeted and side-by-side installs don't clobber
+# each other. Idempotent — re-running docker compose up reuses the volume.
+#
+# RENAMED 2026-05-17 to force a fresh MySQL data dir: the v0.6.2 refactor
+# swapped postgres → mysql for the HMS backing service but kept the same
+# named volume (`udp-postgres-hms-data`). MySQL 8 on first boot saw the
+# leftover postgres files and aborted with:
+#   [ERROR] [MY-010457] --initialize specified but the data directory
+#   has files in it. Aborting.
+# Renaming the constant to `udp-mysql-hms-data` gives MySQL a virgin
+# data dir on every host that has never run the new volume name before.
+# Operators migrating from a previous postgres-hms install can reclaim
+# the ~200 MB of orphaned postgres data with:
+#   docker volume rm udp-postgres-hms-data
+# Polaris still uses Postgres, so `_PG_POLARIS_VOLUME` is unchanged.
+_MYSQL_HMS_VOLUME = "udp-mysql-hms-data"
+_PG_POLARIS_VOLUME = "udp-postgres-polaris-data"
+
+
+# ---------- helpers ----------
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """tmp + os.replace atomic write. Same pattern as airflow_overlay.py
+    — avoids half-written files on Ctrl-C or power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _network_name(install_dir: Path, env: dict) -> str:
+    """Resolve the docker network name to attach to. The base stack lives
+    on `<install_dir.name>_default` by docker compose convention; the env
+    can override via LHS_DOCKER_NETWORK if the operator renamed it."""
+    explicit = (env.get("LHS_DOCKER_NETWORK") or "").strip()
+    if explicit:
+        return explicit
+    return f"{install_dir.name}_default"
+
+
+# ---------- render functions ----------
+
+
+def _trino_service_yaml(env: dict) -> str:
+    """Return ONLY the Trino service YAML block (indented under `services:`).
+
+    No `services:` header, no `networks:` declaration — caller composes
+    those. This lets multiple renderers (`_render_udp_trino_fragment`,
+    `_render_nessie_fragment`, `_render_delta_fragment`) all share the
+    exact same Trino service definition without copy-paste drift.
+
+    Bug fix 2026-05-17 VPS install attempt of udp-trino-local-v0.1:
+    UDP's upstream docker-compose.yml has no Trino service definition,
+    so `docker compose up -d ... trino ...` fails with `no such
+    service: trino`. This block supplies it.
+
+    Trino reads its own catalog config (iceberg/nessie/delta .properties)
+    from /etc/trino/catalog/, which the per-stack bootstrap script
+    writes via `docker cp` after the container is up — so no bind mount
+    or depends_on chain is required at compose level.
+    """
+    return (
+        "  trino:\n"
+        f"    image: {_TRINO_IMAGE}\n"
+        "    container_name: udp-trino\n"
+        "    restart: unless-stopped\n"
+        "    environment:\n"
+        "      # JVM + memory caps wired via compose interpolation so the\n"
+        "      # operator can tune via the install's .env without\n"
+        "      # re-rendering this fragment. Defaults match the manifest\n"
+        "      # env_defaults block (10 GB recommended tier — 3 GB heap).\n"
+        "      JAVA_TOOL_OPTIONS: ${TRINO_JAVA_OPTS:--Xms3G -Xmx3G -XX:+UseG1GC -XX:+ExplicitGCInvokesConcurrent -XX:+ExitOnOutOfMemoryError}\n"
+        "      TRINO_QUERY_MAX_MEMORY_PER_NODE: ${TRINO_QUERY_MAX_MEMORY_PER_NODE:-1.5GB}\n"
+        "      TRINO_QUERY_MAX_MEMORY: ${TRINO_QUERY_MAX_MEMORY:-1.5GB}\n"
+        "    ports:\n"
+        "      - \"8080:8080\"\n"
+        "    healthcheck:\n"
+        "      test: [\"CMD-SHELL\", \"curl -fsS http://localhost:8080/v1/info >/dev/null\"]\n"
+        "      interval: 15s\n"
+        "      timeout: 5s\n"
+        "      retries: 30\n"
+        "      start_period: 60s\n"
+        "    networks:\n"
+        "      - default\n"
+    )
+
+
+def _render_udp_trino_fragment(env: dict) -> str:
+    """Render the Trino-only fragment for udp-trino-local-v0.1.
+
+    UDP's upstream docker-compose.yml ships minio + iceberg-rest +
+    starrocks-fe + starrocks-be + create-bucket, but NOT trino. The
+    udp-trino-local-v0.1 stack's `start` step calls `docker compose up
+    -d minio iceberg-rest trino starrocks-fe starrocks-be create-bucket`
+    — without this fragment that fails with `no such service: trino`.
+
+    Trino-only fragment (no Nessie, no HMS). The stack uses the upstream
+    iceberg-rest catalog, which the bootstrap wires via
+    /etc/trino/catalog/iceberg.properties after Trino starts.
+    """
+    return (
+        "# docker-compose.fragment.yml -- Trino service for "
+        "udp-trino-local-v0.1.\n"
+        "# Generated by backend/stack_compose_fragments.py.\n"
+        "#\n"
+        "# REQUIRED: UDP's upstream docker-compose.yml does not ship a\n"
+        "# Trino service. This fragment supplies it so `docker compose\n"
+        "# up -d ... trino ...` actually has a service to bring up.\n"
+        "services:\n"
+        + _trino_service_yaml(env)
+        + "networks:\n"
+        "  default: {}\n"
+    )
+
+
+def _render_nessie_fragment(env: dict) -> str:
+    """Render the Nessie + Trino fragment for iceberg-nessie-trino-local-v0.1.
+
+    Two services: `nessie` on port 19120 (Iceberg REST endpoint) and
+    `trino` on port 8080 (federated SQL).
+
+    Nessie uses an in-memory version store for the pilot (no persistent
+    volume — restart wipes branches/commits, which is fine for v0.1
+    candidate scope). OIDC explicitly disabled so the catalog accepts
+    anonymous Iceberg REST calls from Spark / Trino / StarRocks without
+    token plumbing in the bootstrap script.
+
+    Trino is added here (vs. its own fragment) because the stack-id
+    dispatch produces one fragment per stack. The Trino service block
+    is shared with `_render_udp_trino_fragment` and
+    `_render_delta_fragment` via `_trino_service_yaml()` to avoid drift.
+    """
+    return (
+        "# docker-compose.fragment.yml -- Nessie + Trino services for "
+        "iceberg-nessie-trino-local-v0.1.\n"
+        "# Generated by backend/stack_compose_fragments.py.\n"
+        "#\n"
+        "# REQUIRED: UDP's upstream docker-compose.yml does not ship a\n"
+        "# Nessie or Trino service. This fragment supplies both so\n"
+        "# `docker compose up` for this stack actually has a catalog +\n"
+        "# query engine to bring up.\n"
+        "services:\n"
+        "  nessie:\n"
+        f"    image: {_NESSIE_IMAGE}\n"
+        "    container_name: udp-nessie\n"
+        "    restart: unless-stopped\n"
+        "    environment:\n"
+        "      # IN_MEMORY is the pilot-scope default. Swap to JDBC and\n"
+        "      # add a postgres-nessie service when promoting past v0.1.\n"
+        "      NESSIE_VERSION_STORE_TYPE: IN_MEMORY\n"
+        "      QUARKUS_OIDC_TENANT_ENABLED: \"false\"\n"
+        "      # S3 + warehouse config moved OUT of env vars and into a\n"
+        "      # bind-mounted application.properties (see volumes: below).\n"
+        "      # 2026-05-17: 3 prior attempts to wire S3 STATIC credentials\n"
+        "      # via NESSIE_CATALOG_SERVICE_S3_* env vars + URN reverse-\n"
+        "      # mapping all failed on Nessie 0.99 — SmallRye's env-var\n"
+        "      # reverse-mapping is unreliable for dotted-hyphenated\n"
+        "      # secret-config names. The official projectnessie demo at\n"
+        "      # docker/catalog-auth-s3/docker-compose.yml uses dotted\n"
+        "      # Quarkus properties (via -D or properties file), not env.\n"
+        "    volumes:\n"
+        "      - ./nessie.properties:/deployments/config/application.properties:ro\n"
+        "    ports:\n"
+        "      - \"19120:19120\"\n"
+        "    healthcheck:\n"
+        "      test: [\"CMD\", \"curl\", \"-fsS\", \"http://localhost:19120/q/health\"]\n"
+        "      interval: 10s\n"
+        "      timeout: 5s\n"
+        "      retries: 12\n"
+        "    networks:\n"
+        "      - default\n"
+        + _trino_service_yaml(env)
+        # Codex P0 fix 2026-05-17: the fragment used to declare
+        # `default: { external: true }` which only works if the network
+        # is pre-created. With docker compose -f base -f fragment, the
+        # base compose creates `default` on first start and our fragment
+        # joins by reference. No `external:` and no explicit `name:`
+        # needed — let compose's merge logic do the work.
+        + "networks:\n"
+        "  default: {}\n"
+    )
+
+
+def _render_hms_fragment(env: dict) -> str:
+    """MySQL + Hive Metastore for hudi-hms-spark + delta-hms-spark-trino.
+
+    bitsondatadev/hive-metastore is MySQL-only by design (entrypoint
+    hard-codes port 3306 + dbType mysql). MySQL JDBC driver bundled,
+    no jar download needed. Operator MUST also bind-mount a
+    metastore-site.xml — written by `_render_hms_site_xml()` and
+    dropped into install_dir by write_fragment.
+    """
+    return (
+        "# docker-compose.fragment.yml -- MySQL + Hive Metastore for\n"
+        "# hudi-hms-spark-local-v0.1 / delta-hms-spark-trino-local-v0.1.\n"
+        "# Generated by backend/stack_compose_fragments.py.\n"
+        "services:\n"
+        "  mysql-hms:\n"
+        f"    image: {_MYSQL_IMAGE}\n"
+        "    container_name: udp-mysql-hms\n"
+        "    restart: unless-stopped\n"
+        "    environment:\n"
+        "      MYSQL_DATABASE: metastore\n"
+        "      MYSQL_USER: hive\n"
+        "      MYSQL_PASSWORD: ${HMS_DB_PASSWORD:-hive_password_pilot}\n"
+        "      MYSQL_ROOT_PASSWORD: ${HMS_DB_ROOT_PASSWORD:-root_password_pilot}\n"
+        "    volumes:\n"
+        f"      - {_MYSQL_HMS_VOLUME}:/var/lib/mysql\n"
+        "    expose:\n"
+        '      - "3306"\n'
+        "    healthcheck:\n"
+        # Codex review 2026-05-17: prefer checking the HMS user + db over
+        # bare root ping — this proves init scripts ran AND user/grants
+        # are in place AND the metastore db exists. Without this stricter
+        # check, mysqladmin ping can go green during the MySQL official
+        # image's TWO-PHASE init (temp startup then final startup), and
+        # the dependent HMS container then crashes against an incomplete
+        # MySQL. start_period 60s is generous enough for the cold-volume
+        # init on a stock VPS.
+        '      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uhive -p$${MYSQL_PASSWORD} -D metastore -e \\"SELECT 1\\" >/dev/null"]\n'
+        "      interval: 10s\n"
+        "      timeout: 5s\n"
+        "      retries: 30\n"
+        "      start_period: 60s\n"
+        "    networks:\n"
+        "      - default\n"
+        "  hive-metastore:\n"
+        f"    image: {_HMS_IMAGE}\n"
+        "    container_name: udp-hive-metastore\n"
+        "    restart: unless-stopped\n"
+        "    depends_on:\n"
+        # 2026-05-17 fix: was `condition: service_healthy` which compose v5
+        # enforces synchronously at up-time. MySQL's first-init takes
+        # 30-60s for permission setup; compose timed out at ~4s waiting.
+        # HMS's own entrypoint has its own `nc -z $METASTORE_DB_HOSTNAME
+        # 3306` wait loop, so service_started is sufficient — HMS will
+        # block-loop until MySQL is reachable, then schematool runs.
+        "      mysql-hms:\n"
+        "        condition: service_started\n"
+        "    environment:\n"
+        "      METASTORE_DB_HOSTNAME: mysql-hms\n"
+        "    volumes:\n"
+        "      - ./hive-metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro\n"
+        "    expose:\n"
+        '      - "9083"\n'
+        "    healthcheck:\n"
+        '      test: ["CMD-SHELL", "bash -c \'</dev/tcp/127.0.0.1/9083\'"]\n'
+        "      interval: 15s\n"
+        "      timeout: 5s\n"
+        "      retries: 20\n"
+        "      start_period: 30s\n"
+        "    networks:\n"
+        "      - default\n"
+        "volumes:\n"
+        f"  {_MYSQL_HMS_VOLUME}:\n"
+        "networks:\n"
+        "  default: {}\n"
+    )
+
+
+def _render_delta_fragment(env: dict) -> str:
+    """Render the HMS + Trino fragment for delta-hms-spark-trino-local-v0.1.
+
+    Same MySQL + Hive Metastore body as `_render_hms_fragment` PLUS the
+    Trino service appended before the trailing `volumes:` + `networks:`
+    blocks. We can't just append to `_render_hms_fragment`'s output
+    because that block emits its own trailing `volumes:` + `networks:`
+    sections — the Trino service would land AFTER those, which is
+    invalid YAML (services must come before top-level volumes/networks
+    blocks for clean ordering, even if compose tolerates the reverse).
+
+    Hudi-HMS-Spark uses `_render_hms_fragment` (no Trino); only the
+    Delta stack needs Trino layered on top, hence the separate renderer.
+    """
+    return (
+        "# docker-compose.fragment.yml -- MySQL + Hive Metastore + Trino\n"
+        "# for delta-hms-spark-trino-local-v0.1.\n"
+        "# Generated by backend/stack_compose_fragments.py.\n"
+        "services:\n"
+        "  mysql-hms:\n"
+        f"    image: {_MYSQL_IMAGE}\n"
+        "    container_name: udp-mysql-hms\n"
+        "    restart: unless-stopped\n"
+        "    environment:\n"
+        "      MYSQL_DATABASE: metastore\n"
+        "      MYSQL_USER: hive\n"
+        "      MYSQL_PASSWORD: ${HMS_DB_PASSWORD:-hive_password_pilot}\n"
+        "      MYSQL_ROOT_PASSWORD: ${HMS_DB_ROOT_PASSWORD:-root_password_pilot}\n"
+        "    volumes:\n"
+        f"      - {_MYSQL_HMS_VOLUME}:/var/lib/mysql\n"
+        "    expose:\n"
+        '      - "3306"\n'
+        "    healthcheck:\n"
+        '      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uhive -p$${MYSQL_PASSWORD} -D metastore -e \\"SELECT 1\\" >/dev/null"]\n'
+        "      interval: 10s\n"
+        "      timeout: 5s\n"
+        "      retries: 30\n"
+        "      start_period: 60s\n"
+        "    networks:\n"
+        "      - default\n"
+        "  hive-metastore:\n"
+        f"    image: {_HMS_IMAGE}\n"
+        "    container_name: udp-hive-metastore\n"
+        "    restart: unless-stopped\n"
+        "    depends_on:\n"
+        "      mysql-hms:\n"
+        "        condition: service_started\n"
+        "    environment:\n"
+        "      METASTORE_DB_HOSTNAME: mysql-hms\n"
+        "    volumes:\n"
+        "      - ./hive-metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro\n"
+        "    expose:\n"
+        '      - "9083"\n'
+        "    healthcheck:\n"
+        '      test: ["CMD-SHELL", "bash -c \'</dev/tcp/127.0.0.1/9083\'"]\n'
+        "      interval: 15s\n"
+        "      timeout: 5s\n"
+        "      retries: 20\n"
+        "      start_period: 30s\n"
+        "    networks:\n"
+        "      - default\n"
+        + _trino_service_yaml(env)
+        + "volumes:\n"
+        f"  {_MYSQL_HMS_VOLUME}:\n"
+        "networks:\n"
+        "  default: {}\n"
+    )
+
+
+def _render_nessie_properties(env: dict) -> str:
+    """Quarkus application.properties for Nessie 0.99 S3 + warehouse config.
+
+    Bind-mounted into the Nessie container at
+    /deployments/config/application.properties (Quarkus's standard
+    config location, auto-loaded on boot).
+
+    2026-05-17: three prior attempts to wire S3 STATIC credentials
+    through NESSIE_CATALOG_SERVICE_S3_* env vars + the
+    `urn:nessie-secret:quarkus:<name>` reverse-mapping all failed on
+    Nessie 0.99 -- SmallRye env-var reverse-mapping is unreliable for
+    dotted-hyphenated secret-config names. We then tried the URN form
+    in this properties file directly, and Nessie 0.99 STILL refused to
+    start (container exited at boot with the URN line present; a
+    minimal properties file with no credentials brought it up clean).
+
+    EXPERIMENT (this commit): drop the URN indirection AND the
+    auth-type=STATIC line. Use the literal short-form keys
+    `access-key-id` / `secret-access-key` -- some Nessie builds accept
+    these directly and auto-detect static auth from key presence.
+
+    FALLBACK if this still fails (try in next session):
+      1. Add `nessie.catalog.service.s3.default-options.credentials-provider=STATIC`
+         alongside the literal keys.
+      2. Drop the keys from the properties file entirely and pass
+         AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY on the nessie
+         service's env block -- Nessie's S3 client (AWS SDK v2) reads
+         its own process env via the default credentials provider chain.
+
+    Credentials are interpolated from the env dict here (Python
+    f-string) -- NOT compose ${VAR:-default} interpolation -- because
+    this file is read by Nessie/Quarkus directly, not by docker compose.
+    """
+    minio_user = env.get("MINIO_ROOT_USER", "admin")
+    minio_pass = env.get("MINIO_ROOT_PASSWORD", "udp_admin_12345")
+    return (
+        "# Nessie catalog S3 + warehouse config -- literal access-key-id /\n"
+        "# secret-access-key form. URN indirection was rejected by Nessie\n"
+        "# 0.99 at boot; this experiment uses the short-form keys directly\n"
+        "# and relies on Nessie to auto-detect static auth from their\n"
+        "# presence (no explicit auth-type line).\n"
+        "nessie.catalog.default-warehouse=warehouse\n"
+        "nessie.catalog.warehouses.warehouse.location=s3://datalake/warehouse\n"
+        "nessie.catalog.service.s3.default-options.endpoint=http://minio:9000\n"
+        "nessie.catalog.service.s3.default-options.region=us-east-1\n"
+        "nessie.catalog.service.s3.default-options.path-style-access=true\n"
+        f"nessie.catalog.service.s3.default-options.access-key-id={minio_user}\n"
+        f"nessie.catalog.service.s3.default-options.secret-access-key={minio_pass}\n"
+    )
+
+
+def _render_hms_site_xml(env: dict) -> str:
+    """metastore-site.xml that bitsondatadev HMS bind-mount expects."""
+    pw = env.get("HMS_DB_PASSWORD", "hive_password_pilot")
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        '<configuration>\n'
+        '  <property>\n'
+        '    <name>javax.jdo.option.ConnectionURL</name>\n'
+        '    <value>jdbc:mysql://mysql-hms:3306/metastore?useSSL=false&amp;allowPublicKeyRetrieval=true</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>javax.jdo.option.ConnectionDriverName</name>\n'
+        '    <value>com.mysql.cj.jdbc.Driver</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>javax.jdo.option.ConnectionUserName</name>\n'
+        '    <value>hive</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>javax.jdo.option.ConnectionPassword</name>\n'
+        f'    <value>{pw}</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>metastore.thrift.uris</name>\n'
+        '    <value>thrift://localhost:9083</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>metastore.task.threads.always</name>\n'
+        '    <value>org.apache.hadoop.hive.metastore.events.EventCleanerTask</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>metastore.expression.proxy</name>\n'
+        '    <value>org.apache.hadoop.hive.metastore.DefaultPartitionExpressionProxy</value>\n'
+        '  </property>\n'
+        '  <property>\n'
+        '    <name>metastore.warehouse.dir</name>\n'
+        '    <value>s3a://datalake/warehouse</value>\n'
+        '  </property>\n'
+        '</configuration>\n'
+    )
+
+
+def _render_polaris_fragment(env: dict) -> str:
+    """Render the Polaris fragment.
+
+    Two services: `postgres-polaris` (JDBC persistence backing store)
+    and `polaris` (catalog REST on 8181 + management API on 8182).
+    Host port 5433 for the Postgres so it doesn't conflict with HMS
+    Postgres on 5432 if an operator ever runs both stacks side-by-side.
+    Inside the docker network both are still on 5432 (the container
+    port is unchanged), so polaris's JDBC URL points at port 5432.
+    """
+    return (
+        "# docker-compose.fragment.yml -- Polaris + backing Postgres for\n"
+        "# iceberg-polaris-spark-local-v0.1.\n"
+        "# Generated by backend/stack_compose_fragments.py.\n"
+        "#\n"
+        "# REQUIRED: UDP's upstream docker-compose.yml does not ship\n"
+        "# Polaris or its backing Postgres. This fragment supplies both\n"
+        "# so the Polaris-backed stack actually has a catalog to bring up.\n"
+        "#\n"
+        "# Host port 5433 for the Postgres — 5432 may be held by the HMS\n"
+        "# Postgres if an operator runs both stacks on the same host. The\n"
+        "# CONTAINER side stays on 5432, so polaris's JDBC URL uses 5432.\n"
+        "services:\n"
+        "  postgres-polaris:\n"
+        f"    image: {_POSTGRES_IMAGE}\n"
+        "    container_name: udp-postgres-polaris\n"
+        "    restart: unless-stopped\n"
+        "    environment:\n"
+        "      POSTGRES_USER: polaris\n"
+        "      POSTGRES_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris_password_pilot}\n"
+        "      POSTGRES_DB: polaris\n"
+        "    volumes:\n"
+        f"      - {_PG_POLARIS_VOLUME}:/var/lib/postgresql/data\n"
+        # Bug fix 2026-05-17 VPS install: don't bind host port (same
+        # rationale as postgres-hms — Polaris only reaches its backing
+        # DB over the docker network; no host port needed).
+        "    expose:\n"
+        "      - \"5432\"\n"
+        "    healthcheck:\n"
+        "      test: [\"CMD\", \"pg_isready\", \"-U\", \"polaris\", \"-d\", \"polaris\"]\n"
+        "      interval: 10s\n"
+        "      timeout: 5s\n"
+        "      retries: 10\n"
+        "    networks:\n"
+        "      - default\n"
+        "  polaris:\n"
+        f"    image: {_POLARIS_IMAGE}\n"
+        "    container_name: udp-polaris\n"
+        "    restart: unless-stopped\n"
+        "    depends_on:\n"
+        "      postgres-polaris:\n"
+        "        condition: service_healthy\n"
+        "    environment:\n"
+        # Codex P0 fix 2026-05-17: Polaris 1.4.x uses Quarkus datasource
+        # env vars + the persistence type is `relational-jdbc`, not `jdbc`.
+        # The bootstrap script also expects POLARIS_BOOTSTRAP_CREDENTIALS
+        # to seed the realm's root principal credential — without it the
+        # script's token request to /api/catalog/v1/oauth/tokens 401s.
+        "      POLARIS_PERSISTENCE_TYPE: relational-jdbc\n"
+        "      QUARKUS_DATASOURCE_DB_KIND: postgresql\n"
+        "      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres-polaris:5432/polaris?sslmode=disable\n"
+        "      QUARKUS_DATASOURCE_USERNAME: polaris\n"
+        "      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris_password_pilot}\n"
+        "      # Bootstrap credential the runner_extra_scripts polaris\n"
+        "      # bootstrap uses to obtain the first OAuth2 token.\n"
+        "      # Gemini research 2026-05-17: Polaris 1.4.x expects a TRIPLE\n"
+        "      # comma-separated `realm,clientId,clientSecret` -- NOT\n"
+        "      # `realm,clientId:clientSecret` (colon between id+secret is\n"
+        "      # wrong and causes the bootstrap to skip seeding the root\n"
+        "      # principal, leading to 401 on /api/catalog/v1/oauth/tokens).\n"
+        "      # Ref: https://github.com/apache/polaris/issues/348\n"
+        "      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_BOOTSTRAP_CREDENTIALS:-default-realm,root,s3cr3t}\n"
+        "      # Gemini Polaris 1.4.1 audit 2026-05-17: without an explicit\n"
+        "      # realm-context realms list, Polaris 1.4.1 defaults to a\n"
+        "      # different realm name and the bootstrap credentials above\n"
+        "      # never apply -- the root principal is seeded into a realm\n"
+        "      # nobody talks to, so the bootstrap script's token request\n"
+        "      # 401s. Pin the realm explicitly so realm IDs line up across\n"
+        "      # bootstrap, Spark, and StarRocks.\n"
+        "      # Ref: https://polaris.apache.org/docs/configuration/#bootstrapping\n"
+        "      POLARIS_REALM_CONTEXT_REALMS: default-realm\n"
+        "    ports:\n"
+        "      - \"8181:8181\"\n"
+        "      - \"8182:8182\"\n"
+        "    healthcheck:\n"
+        # Live VPS debug 2026-05-17 (inst_d58762cb19 + inst_945d4eca29):
+        # Polaris container logs showed `GET /q/health` returning 404 in
+        # a tight loop -- that path isn't exposed by the Polaris 1.4.x
+        # image (Quarkus health is on the management port but auth-gated
+        # in this build). Switch to a pure TCP probe: if the catalog
+        # port is accepting connections, the JVM is up. Avoids the
+        # 401-loop noise from auth-gated HTTP probes.
+        "      test: [\"CMD-SHELL\", \"bash -c 'echo > /dev/tcp/127.0.0.1/8181' || exit 1\"]\n"
+        "      interval: 10s\n"
+        "      timeout: 5s\n"
+        "      retries: 30\n"
+        "      start_period: 60s\n"
+        "    networks:\n"
+        "      - default\n"
+        "volumes:\n"
+        f"  {_PG_POLARIS_VOLUME}:\n"
+        # Codex P0 fix 2026-05-17: the fragment used to declare
+        # `default: { external: true }` which only works if the network
+        # is pre-created. With docker compose -f base -f fragment, the
+        # base compose creates `default` on first start and our fragment
+        # joins by reference. No `external:` and no explicit `name:`
+        # needed — let compose's merge logic do the work.
+        "networks:\n"
+        "  default: {}\n"
+    )
+
+
+def _network_name_token(env: dict) -> str:
+    """Resolve the docker network name from the env dict alone.
+
+    Mirrors `_network_name` but without an install_dir — we can't always
+    know it at render time (tests render directly). When the env carries
+    `LHS_DOCKER_NETWORK`, honor it; otherwise default to `udp_default`,
+    which docker compose auto-creates for a directory literally named
+    `udp`. The runner's call path passes the real network name in via
+    env when needed; tests rely on the default.
+    """
+    explicit = (env.get("LHS_DOCKER_NETWORK") or "").strip()
+    if explicit:
+        return explicit
+    return env.get("LHS_BASE_NETWORK_NAME") or "udp_default"
+
+
+# ---------- dispatch ----------
+
+
+_FRAGMENT_RENDERERS: dict[str, Callable[[dict], str]] = {
+    "udp-trino-local-v0.1":              _render_udp_trino_fragment,
+    "iceberg-nessie-trino-local-v0.1":  _render_nessie_fragment,
+    "hudi-hms-spark-local-v0.1":        _render_hms_fragment,
+    "delta-hms-spark-trino-local-v0.1": _render_delta_fragment,
+    "iceberg-polaris-spark-local-v0.1": _render_polaris_fragment,
+}
+
+
+# ---------- public API ----------
+
+
+def write_fragment(stack_id: str, install_dir: Path,
+                   env: dict[str, str]) -> Optional[Path]:
+    """Write the per-stack compose fragment into install_dir.
+
+    Returns the Path to the written `docker-compose.fragment.yml`, or
+    `None` if the given `stack_id` has no fragment registered (the
+    stable `udp-local-v0.2` stack hits this branch — UDP's upstream
+    compose already has every service it needs).
+
+    Idempotent — re-running with the same install_dir overwrites the
+    file atomically. Safe to call from `runner._step_env` every install.
+
+    The env dict is the merged install env (manifest defaults + user
+    overrides). We pass it through to the renderer so the network name
+    can be honored via `LHS_DOCKER_NETWORK` / `LHS_BASE_NETWORK_NAME`.
+    For the install path, the renderer's `_network_name_token` default
+    of `udp_default` is then OVERRIDDEN by the per-install network the
+    runner injects through env.
+    """
+    renderer = _FRAGMENT_RENDERERS.get(stack_id)
+    if renderer is None:
+        log.debug("no fragment renderer for stack_id=%r", stack_id)
+        return None
+
+    # If the env doesn't already carry an explicit network name, fall
+    # back to the install_dir-derived default so the fragment attaches
+    # to the right network for THIS install rather than a generic one.
+    enriched = dict(env or {})
+    if not (enriched.get("LHS_DOCKER_NETWORK") or "").strip():
+        enriched["LHS_BASE_NETWORK_NAME"] = _network_name(install_dir, enriched)
+
+    body = renderer(enriched)
+    path = install_dir / FRAGMENT_FILENAME
+    _atomic_write(path, body)
+    # For HMS-using stacks, also drop a metastore-site.xml alongside the
+    # fragment — bind-mounted into the HMS container so its entrypoint
+    # picks up the right JDBC URL. Refactored 2026-05-17 after VPS
+    # install attempts 2-6 fought the image's MySQL-only assumption.
+    if stack_id in ("hudi-hms-spark-local-v0.1", "delta-hms-spark-trino-local-v0.1"):
+        site_path = install_dir / "hive-metastore-site.xml"
+        _atomic_write(site_path, _render_hms_site_xml(enriched))
+        log.info("wrote hive-metastore-site.xml for stack=%s", stack_id)
+    # 2026-05-17: Nessie 0.99 SmallRye env-var reverse-mapping doesn't
+    # resolve dotted-hyphenated secret-config names reliably. Drop a
+    # canonical Quarkus application.properties next to the fragment so
+    # the compose bind-mount picks up the real S3 + warehouse config.
+    if stack_id == "iceberg-nessie-trino-local-v0.1":
+        props_path = install_dir / "nessie.properties"
+        _atomic_write(props_path, _render_nessie_properties(enriched))
+        log.info("wrote nessie.properties for stack=%s", stack_id)
+    log.info(
+        "stack compose fragment written stack_id=%s install_dir=%s",
+        stack_id, install_dir,
+    )
+    return path
