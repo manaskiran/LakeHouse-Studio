@@ -28,3 +28,4 @@ Thumbs.db
 .idea/
 .claude/
 stacks/enterprise-hadoop/.env
+stacks/enterprise-hadoop/jars/

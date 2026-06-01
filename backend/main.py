@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,11 +21,19 @@ from .models import InstallRequest, InspectionReport, LogEvent
 from .notifications import NotifyEvent, get_dispatcher, notify
 from .catalog import (
     categories as catalog_categories,
+    component_index as catalog_component_index,
     destinations as catalog_destinations,
     goals as catalog_goals,
     recommended_sets as catalog_recommended_sets,
     validate_catalog,
 )
+from . import version_fetcher
+from . import compat_ai
+from . import image_builder as img_bld
+from . import ai_provisioner as ai_prov
+from . import custom_stack_runner as custom_runner
+from . import stack_composer
+from . import component_registry as comp_reg
 from .compatibility import (
     list_locks,
     list_upgrade_candidates,
@@ -341,6 +350,465 @@ def get_catalog():
 @app.get("/api/goals", dependencies=[AuthDep, CatalogOk])
 def get_goals():
     return catalog_goals()
+
+
+# ---------- Dynamic version discovery ----------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_compat_rules() -> dict:
+    import yaml
+    path = ROOT / "stacks" / "version-compat-rules.yaml"
+    if not path.exists():
+        return {"rules": []}
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {"rules": []}
+
+
+@app.get("/api/compat-rules")
+def get_compat_rules():
+    """Return the version compatibility rules used by the cascade picker.
+
+    The frontend loads this once and applies cascade filtering client-side.
+    """
+    return _load_compat_rules()
+
+
+@app.get("/api/versions/{component_id}")
+async def get_component_versions(component_id: str, refresh: bool = False):
+    """Return available versions for a component from its official source.
+
+    Dynamic versions (fetched from Apache downloads / GitHub releases) are
+    merged with the catalog's static ``version_options`` so the UI always has
+    a fallback even when the upstream fetch fails or the component has no
+    registered source.
+
+    Query param ``?refresh=true`` bypasses the 1-hour TTL cache.
+    """
+    import asyncio
+
+    # Fetch dynamic versions in a thread so we don't block the event loop
+    loop = asyncio.get_event_loop()
+    dynamic: list[dict] = await loop.run_in_executor(
+        None, lambda: version_fetcher.get_versions(component_id, force_refresh=refresh)
+    )
+
+    # Collect catalog static version_options as fallback / supplement
+    idx = catalog_component_index()
+    comp = idx.get(component_id)
+    catalog_versions: list[dict] = []
+    if comp:
+        for opt in comp.get("version_options") or []:
+            catalog_versions.append({
+                "version": str(opt["version"]),
+                "label": opt.get("label") or str(opt["version"]),
+                "source": "catalog",
+                "default": bool(opt.get("default")),
+                "cart_id": opt.get("cart_id"),
+                "badges": opt.get("badges") or [],
+                "tagline": opt.get("tagline") or "",
+            })
+
+    # Merge: dynamic first, then fill in any catalog versions not already present
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for v in dynamic:
+        if v.get("error"):
+            # Surface the error but don't block the catalog versions from showing
+            continue
+        seen.add(v["version"])
+        merged.append(v)
+    for v in catalog_versions:
+        if v["version"] not in seen:
+            seen.add(v["version"])
+            merged.append(v)
+
+    # Sort descending by version tuple
+    def _vtuple(ver: str) -> tuple:
+        import re
+        nums = re.findall(r'\d+', ver.split('_')[0].split('+')[0])
+        return tuple(int(n) for n in nums[:5])
+
+    merged.sort(key=lambda x: _vtuple(x["version"]), reverse=True)
+
+    # Mark the catalog default if no dynamic default is set
+    default_set = any(v.get("default") for v in merged)
+    if not default_set and merged:
+        # Mark catalog default if present, else first entry
+        for v in merged:
+            if v.get("source") == "catalog" and v.get("default"):
+                break
+        else:
+            merged[0]["default"] = True
+
+    cached_at = version_fetcher.get_cached_at(component_id)
+    had_error = any(v.get("error") for v in dynamic)
+    return {
+        "component_id": component_id,
+        "versions": merged,
+        "count": len(merged),
+        "cached_at": cached_at,
+        "has_dynamic_source": component_id in version_fetcher.list_registered_components(),
+        "fetch_error": dynamic[0].get("label") if had_error and dynamic else None,
+    }
+
+
+@app.post("/api/versions/{component_id}/refresh")
+async def refresh_component_versions(component_id: str):
+    """Force-refresh the version cache for a specific component."""
+    version_fetcher.clear_cache(component_id)
+    return await get_component_versions(component_id, refresh=True)
+
+
+# ---------- AI Compatibility Research ----------------------------------------
+
+@app.post("/api/compat-ai/research")
+async def ai_research_compat(body: dict):
+    """Ask the LLM which versions are compatible with a given anchor selection.
+
+    Body: { "anchor_id": "hdfs", "anchor_version": "3.4.1", "force_refresh": false }
+    Returns: { "anchor_id", "anchor_version", "compat": {comp_id: version}, "cached", "error" }
+    """
+    anchor_id = body.get("anchor_id", "")
+    anchor_version = body.get("anchor_version", "")
+    force_refresh = body.get("force_refresh", False)
+
+    if not anchor_id or not anchor_version:
+        return {"error": "anchor_id and anchor_version are required", "compat": {}}
+
+    # Gather all available versions for all registered components
+    loop = asyncio.get_event_loop()
+    all_comp_ids = version_fetcher.list_registered_components()
+
+    async def _fetch_one(cid: str) -> tuple[str, list[str]]:
+        versions = await loop.run_in_executor(
+            None, lambda c=cid: version_fetcher.get_versions(c)
+        )
+        return cid, [v["version"] for v in versions if not v.get("error")]
+
+    tasks = [_fetch_one(cid) for cid in all_comp_ids]
+    pairs = await asyncio.gather(*tasks)
+    available_versions = dict(pairs)
+
+    result = await loop.run_in_executor(
+        None,
+        lambda: compat_ai.research_compat(
+            anchor_id, anchor_version, available_versions, force_refresh=force_refresh
+        ),
+    )
+    return result
+
+
+@app.post("/api/compat-ai/clear-cache")
+async def clear_ai_compat_cache(body: dict | None = None):
+    anchor_id = (body or {}).get("anchor_id")
+    anchor_version = (body or {}).get("anchor_version")
+    compat_ai.clear_ai_cache(anchor_id, anchor_version)
+    return {"ok": True}
+
+
+# ---------- Image Build Pipeline ---------------------------------------------
+# Builds custom Studio Spark images (spark-hudi, spark-delta) by:
+#   1. LLM-researching the best addon version for the current Spark base
+#   2. Validating the Maven jar URL exists
+#   3. Patching the Dockerfile + stack YAML
+#   4. Running docker build + docker push (async, streamed via SSE)
+
+@app.post("/api/image-build/research")
+async def image_build_research(body: dict):
+    """LLM-research the best addon version for image_id (spark-hudi or spark-delta)."""
+    image_id = body.get("image_id", "")
+    if image_id not in img_bld.IMAGES:
+        raise HTTPException(400, f"Unknown image_id '{image_id}'. Valid: {list(img_bld.IMAGES)}")
+
+    addon_id = img_bld.IMAGES[image_id]["addon_id"]
+    loop = asyncio.get_event_loop()
+    raw_versions = await loop.run_in_executor(
+        None, lambda: version_fetcher.get_versions(addon_id)
+    )
+    available = [v["version"] for v in raw_versions if not v.get("error")]
+
+    result = await loop.run_in_executor(
+        None, lambda: img_bld.research_addon_version(image_id, available)
+    )
+    return result
+
+
+@app.post("/api/image-build/start")
+async def image_build_start(body: dict):
+    """Start an async build+push job. Returns {job_id}."""
+    image_id = body.get("image_id", "")
+    research  = body.get("research")
+    if image_id not in img_bld.IMAGES or not research:
+        raise HTTPException(400, "image_id and research result are required")
+
+    job_id = img_bld.new_job()
+    asyncio.create_task(img_bld.run_pipeline(image_id, job_id, research))
+    return {"job_id": job_id}
+
+
+@app.get("/api/image-build/status/{job_id}")
+async def image_build_status(job_id: str):
+    """Poll job status: {status, lines, result}."""
+    job = img_bld.get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    return job
+
+
+@app.get("/api/image-build/stream/{job_id}")
+async def image_build_stream(job_id: str):
+    """SSE stream of build log lines until the job finishes."""
+    from fastapi.responses import StreamingResponse as _SR
+
+    async def _gen():
+        sent = 0
+        while True:
+            job = img_bld.get_job(job_id)
+            if not job:
+                yield 'data: {"error":"job not found"}\n\n'
+                return
+            lines = job["lines"]
+            while sent < len(lines):
+                payload = json.dumps({"line": lines[sent], "status": job["status"]})
+                yield f"data: {payload}\n\n"
+                sent += 1
+            if job["status"] in ("done", "error"):
+                payload = json.dumps({
+                    "done": True,
+                    "status": job["status"],
+                    "result": job.get("result"),
+                })
+                yield f"data: {payload}\n\n"
+                return
+            await asyncio.sleep(0.3)
+
+    return _SR(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- AI Lakehouse Provisioner ------------------------------------------
+
+@app.post("/api/ai-provision/start")
+async def ai_provision_start(body: dict):
+    """Start an AI-driven end-to-end lakehouse provisioning job.
+
+    Body:
+      {
+        "stack_id":        "hudi-hms-spark-local-v0.1",
+        "cart_selections": {"spark-hudi": "3.5.5_1.2.0", "minio": "...", ...},
+        "install_options": {"host": "localhost"}   // optional
+      }
+    Returns: { "job_id": "prov_XXXXXXXXXX" }
+    """
+    stack_id = body.get("stack_id", "")
+    cart     = body.get("cart_selections", {})
+    opts     = body.get("install_options", {})
+    if not stack_id:
+        raise HTTPException(400, "stack_id required")
+    if not cart:
+        raise HTTPException(400, "cart_selections required")
+    job_id = ai_prov.start_provision(stack_id, cart, opts)
+    return {"job_id": job_id}
+
+
+@app.get("/api/ai-provision/status/{job_id}")
+async def ai_provision_status(job_id: str):
+    """Poll current phase and state of a provision job."""
+    job = ai_prov.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return {
+        "job_id":        job.job_id,
+        "stack_id":      job.stack_id,
+        "state":         job.state,
+        "current_phase": job.current_phase,
+        "phase_states":  job.phase_states,
+        "connection_info": job._connection_info,
+    }
+
+
+@app.get("/api/ai-provision/stream/{job_id}")
+async def ai_provision_stream(job_id: str):
+    """SSE stream for an AI provision job — emits all phases + logs in real time."""
+    from fastapi.responses import StreamingResponse as _SR
+
+    job = ai_prov.get_job(job_id)
+    if not job:
+        async def _not_found():
+            yield 'data: {"kind":"error","line":"job not found"}\n\n'
+        return _SR(_not_found(), media_type="text/event-stream",
+                   headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    return _SR(
+        job.stream_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- Stack Builder (wedaa-style custom lakehouse factory) ---------------
+
+@app.get("/api/stack-builder/catalog")
+def stack_builder_catalog():
+    """Return all available components for the Stack Builder UI."""
+    return {
+        "components":       comp_reg.get_catalog(),
+        "category_groups":  comp_reg.CATEGORY_GROUPS,
+        "mutually_exclusive": comp_reg._MUTUALLY_EXCLUSIVE,
+    }
+
+
+@app.get("/api/stack-builder/presets")
+def stack_builder_presets():
+    """Return template cards mapped to their Stack Builder component sets.
+
+    Each template's recommended_set is resolved to real component IDs so the
+    UI can one-click build any card through the (working) Stack Builder
+    pipeline instead of the legacy pre-baked-YAML install path.
+    """
+    from .catalog import recommended_sets as _rsets
+    rsets = _rsets()
+    out = []
+    for t in list_templates():
+        detail = get_template_detail(t["id"])
+        if not detail:
+            continue
+        rs_id = detail.get("recommended_set")
+        comps = list((rsets.get(rs_id) or {}).get("components", []))
+        out.append({
+            "template_id":   t["id"],
+            "label":         t["label"],
+            "icon":          t.get("icon"),
+            "readiness":     t.get("readiness", "pilot"),
+            "components":    comps,
+            "stack_name":    t["id"].replace("_", "-"),
+        })
+    return {"presets": out}
+
+
+@app.post("/api/stack-builder/build-template")
+async def stack_builder_build_template(body: dict):
+    """One-click build a template card through the Stack Builder pipeline.
+
+    Body: { "template_id": "local_demo" }
+    Resolves the template's recommended_set to component IDs and starts the
+    same end-to-end build used by the manual Stack Builder.
+    Returns: { "job_id": "<uuid>", "selected": [...], "stack_name": "..." }
+    """
+    from .catalog import recommended_sets as _rsets
+    template_id = body.get("template_id", "")
+    if not template_id:
+        raise HTTPException(400, "template_id required")
+    detail = get_template_detail(template_id)
+    if not detail:
+        raise HTTPException(404, f"template '{template_id}' not found")
+    rs_id = detail.get("recommended_set")
+    default_comps = list((_rsets().get(rs_id) or {}).get("components", []))
+    # Allow the pre-install dialog to override/extend the component list.
+    comps = list(body.get("selected") or default_comps)
+    if not comps:
+        raise HTTPException(400, f"template '{template_id}' has no installable components")
+    stack_name = body.get("stack_name") or template_id.replace("_", "-")
+    include_experimental = bool(body.get("include_experimental", False))
+    target = body.get("target") or {"mode": "local"}
+    job_id = custom_runner.start_custom_build(comps, {}, stack_name, include_experimental, target)
+    return {"job_id": job_id, "selected": comps, "stack_name": stack_name}
+
+
+@app.post("/api/stack-builder/resolve")
+async def stack_builder_resolve(body: dict):
+    """Resolve dependencies for a component selection.
+
+    Body: { "selected": ["minio", "spark-hudi", "trino"] }
+    Returns: { "resolved": [...], "auto_added": [...] }
+    """
+    selected: list[str] = body.get("selected", [])
+    resolved = comp_reg.resolve_dependencies(selected)
+    auto_added = [c for c in resolved if c not in selected]
+    return {"resolved": resolved, "auto_added": auto_added}
+
+
+@app.post("/api/stack-builder/compose-preview")
+async def stack_builder_compose_preview(body: dict):
+    """Generate a docker-compose.yml preview (no files written to disk).
+
+    Body: { "selected": [...], "versions": {...}, "include_experimental": false }
+    Returns: { "compose_yaml": "...", "resolved": [...], "auto_added": [...],
+               "skipped_experimental": [...], "warnings": [...], "volumes": [...],
+               "config_files_needed": [...], "port_map": {...} }
+    """
+    selected: list[str] = body.get("selected", [])
+    versions: dict = body.get("versions", {})
+    include_experimental: bool = body.get("include_experimental", False)
+    if not selected:
+        raise HTTPException(400, "selected must be a non-empty list of component IDs")
+    plan = stack_composer.compose(selected, versions, include_experimental)
+    return plan
+
+
+@app.post("/api/stack-builder/build")
+async def stack_builder_build(body: dict):
+    """Start an end-to-end AI build for a custom component selection.
+
+    Body:
+      {
+        "selected":              ["minio", "spark-hudi", "trino", ...],
+        "versions":              {"spark-hudi": "3.5.5_1.2.0"},   // optional
+        "stack_name":            "my-hudi-stack",                  // optional
+        "include_experimental":  false                             // optional
+      }
+    Returns: { "job_id": "<uuid>" }
+    """
+    selected: list[str] = body.get("selected", [])
+    versions: dict = body.get("versions", {})
+    stack_name: str = body.get("stack_name", "custom-lakehouse")
+    include_experimental: bool = body.get("include_experimental", False)
+    target: dict = body.get("target") or {"mode": "local"}
+    if not selected:
+        raise HTTPException(400, "selected must be a non-empty list of component IDs")
+    job_id = custom_runner.start_custom_build(selected, versions, stack_name, include_experimental, target)
+    return {"job_id": job_id}
+
+
+@app.get("/api/stack-builder/status/{job_id}")
+async def stack_builder_status(job_id: str):
+    """Poll current phase and state of a custom build job."""
+    job = custom_runner.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return {
+        "job_id":          job.job_id,
+        "stack_name":      job.stack_name,
+        "state":           job.state,
+        "current_phase":   job.current_phase,
+        "phase_states":    job.phase_states,
+        "resolved":        job.resolved,
+        "auto_added":      job.auto_added,
+        "connection_info": job.connection_info,
+        "error":           job.error,
+    }
+
+
+@app.get("/api/stack-builder/stream/{job_id}")
+async def stack_builder_stream(job_id: str):
+    """SSE stream for a custom build job — emits all phases + logs in real time."""
+    from fastapi.responses import StreamingResponse as _SR
+
+    job = custom_runner.get_job(job_id)
+    if not job:
+        async def _not_found():
+            yield 'data: {"kind":"error","line":"job not found"}\n\n'
+        return _SR(_not_found(), media_type="text/event-stream",
+                   headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    return _SR(
+        job.stream_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------- Templates (use-case-shaped views over recommended_sets) ----------

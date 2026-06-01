@@ -15,19 +15,19 @@ goals:
     label: Local demo
     summary: Lakehouse on one machine. Great for evaluation and proof-of-concept work.
     icon: laptop
-    recommended_set: udp-recommended
+    recommended_set: local-demo
     intended_for: ["evaluating", "first-time users", "interview projects"]
   - id: production_lakehouse
     label: Production lakehouse
     summary: Multi-tenant analytics lakehouse for real workloads. Cloud-region friendly.
     icon: building
-    recommended_set: udp-recommended
+    recommended_set: production-lakehouse
     intended_for: ["mid-size companies", "data platform teams"]
   - id: ai_research
     label: AI / ML research platform
     summary: Lakehouse plus columnar serving — feature stores, vector search, BI on the side.
     icon: sparkles
-    recommended_set: udp-recommended
+    recommended_set: ai-ml-research
     intended_for: ["ML teams", "research labs"]
   - id: analytics_layer
     label: Analytics-only
@@ -50,46 +50,50 @@ goals:
     intended_for: ["enterprise data engineering teams", "on-premises deployments", "regulated industries requiring data residency"]
 
 recommended_sets:
+  # ── Per-card differentiated stacks. Each maps to a template card.
+  # All use real component_registry.py IDs; minio-create-bucket is auto-added.
+  local-demo:
+    name: Local Demo Stack
+    components: [iceberg-rest, spark-iceberg, minio, trino]
+
+  production-lakehouse:
+    name: Production Lakehouse
+    # Nessie IS the catalog here (git-for-data) — iceberg-rest dropped to avoid
+    # the two-catalog mutual exclusion.
+    components: [nessie, spark-iceberg, minio, trino, airflow]
+
+  startup-analytics:
+    name: Startup Analytics
+    components: [iceberg-rest, spark-iceberg, minio, starrocks, superset]
+
+  ai-ml-research:
+    name: AI / ML Research
+    components: [iceberg-rest, spark-iceberg, minio, trino, jupyter]
+
+  healthcare-lakehouse:
+    name: Healthcare Lakehouse
+    components: [hdfs, hive-metastore, hadoop-yarn, spark-hudi, trino, ranger-admin]
+
+  fintech-compliance:
+    name: Fintech Compliance
+    components: [iceberg-rest, spark-iceberg, minio, trino, openlineage]
+
+  streaming-lakehouse:
+    name: Streaming Lakehouse
+    components: [iceberg-rest, spark-iceberg, minio, kafka, flink]
+
+  # ── Enterprise On-Prem (8th card) — full Hadoop datalake.
+  enterprise-onprem:
+    name: Enterprise On-Prem Datalake
+    components: [hdfs, hive-metastore, spark-hudi, starrocks, trino, airflow, hadoop-yarn]
+  enterprise-hadoop-docker-recommended:
+    name: Enterprise Hadoop Docker (alias)
+    components: [hdfs, hive-metastore, spark-hudi, starrocks, trino, airflow, hadoop-yarn]
+
+  # ── Legacy alias (kept so older references don't break).
   udp-recommended:
     name: UDP Reference Stack
-    components: [iceberg, iceberg-rest, minio, spark-iceberg, starrocks]
-    stack_id: udp-local-v0.2
-  # CANDIDATE — image tags verified on registry but no end-to-end install
-  # evidence yet. Listed here so the UI/picker can surface it as an
-  # explicit candidate option (gated by the lock file's status="candidate"
-  # which surfaces as a warning via /healthz).
-  udp-trino-recommended:
-    name: UDP Trino Reference Stack (Candidate)
-    components: [iceberg, iceberg-rest, minio, trino, starrocks]
-    stack_id: udp-trino-local-v0.1
-  # ===== v0.6 additions — all candidate =====
-  # Each set lists the components that, when in the cart together,
-  # marry into the matching certified stack. The compatibility checker
-  # uses this mapping to surface a green/yellow/red pill in the UI.
-  iceberg-nessie-recommended:
-    name: Iceberg + Nessie + Trino (Candidate — git-for-data catalog)
-    components: [iceberg, nessie, minio, trino, starrocks]
-    stack_id: iceberg-nessie-trino-local-v0.1
-  hudi-hms-recommended:
-    name: Hudi + Hive Metastore + Spark (Candidate — streaming-first format)
-    components: [hudi, hive-metastore, minio, spark-hudi]
-    stack_id: hudi-hms-spark-local-v0.1
-  delta-hms-recommended:
-    name: Delta Lake + Hive Metastore + Spark + Trino (Candidate)
-    components: [delta, hive-metastore, minio, spark-delta, trino]
-    stack_id: delta-hms-spark-trino-local-v0.1
-  iceberg-polaris-recommended:
-    name: Iceberg + Polaris + Spark + StarRocks (Candidate — RBAC catalog)
-    components: [iceberg, polaris, minio, spark-iceberg, starrocks]
-    stack_id: iceberg-polaris-spark-local-v0.1
-  techsophy-sdp-recommended:
-    name: TechSophy SDP — Hadoop + Hudi + StarRocks + Trino + Ranger
-    components: [hdfs, hudi-v1, hive-metastore-hadoop, tez, spark-hadoop, starrocks, trino-enterprise, ranger-admin, hadoop-yarn, airflow]
-    stack_id: techsophy-sdp-hadoop-v1.0
-  enterprise-hadoop-docker-recommended:
-    name: Enterprise Hadoop Docker — full datalake stack
-    components: [hdfs, hudi-v1, hive-metastore-hadoop, tez, spark-hadoop, starrocks, trino-enterprise, ranger-admin, hadoop-yarn, airflow, pgbouncer, loki, prometheus, grafana]
-    stack_id: enterprise-hadoop-v1.0
+    components: [iceberg-rest, spark-iceberg, minio, starrocks]
 
 # ============================================================
 # Templates — use-case-shaped views over recommended_sets.
@@ -106,125 +110,116 @@ templates:
   - id: local_demo
     label: Local Demo Stack
     icon: laptop
-    elevator_pitch: Lakehouse on your laptop in 10 minutes — the certified UDP reference, nothing extra.
+    elevator_pitch: Lakehouse on your laptop in 10 minutes — Iceberg + MinIO + StarRocks, nothing extra.
     persona: Evaluator / first-time user
     intended_for: ["evaluating", "interview projects", "demos"]
     anti_use_cases: ["regulated PHI/PCI data", "multi-tenant workloads"]
-    recommended_set: udp-recommended
+    recommended_set: local-demo
     readiness: pilot
-    hero_use_cases: ["Try Iceberg + StarRocks end-to-end", "Show stakeholders a working lakehouse"]
+    validated: true
+    hero_use_cases: ["Try Iceberg + Trino end-to-end", "Show stakeholders a working lakehouse in minutes"]
     pending_components: []
     compliance_tags: []
 
   - id: production_lakehouse
     label: Production Lakehouse
     icon: cube
-    elevator_pitch: General-purpose open lakehouse for real workloads — no vertical assumptions.
+    elevator_pitch: Open lakehouse for real workloads — Iceberg + Nessie git-catalog + Trino + Airflow.
     persona: Data platform team / mid-size company
     intended_for: ["production analytics", "multi-team data platforms", "any-industry lakehouses"]
-    anti_use_cases: ["sub-second OLTP", "regulated PHI without your own controls (use Healthcare template)"]
-    recommended_set: udp-recommended
+    anti_use_cases: ["sub-second OLTP", "regulated PHI without your own controls"]
+    recommended_set: production-lakehouse
     readiness: pilot
-    hero_use_cases: ["Multi-engine reads against the same Iceberg tables", "Run BI + ETL + ad-hoc SQL on one open stack"]
-    pending_components:
-      - { name: Dagster, role: orchestration, eta: v0.4, reason: "Asset-first scheduling for production ETL" }
-      - { name: "Prometheus + Grafana", role: observability, eta: v0.4, reason: "Per-component metrics + alerting" }
+    validated: true
+    hero_use_cases: ["Git-for-data branching via Nessie", "Scheduled ETL with Airflow"]
+    pending_components: []
     compliance_tags: []
 
   - id: startup_analytics
     label: Startup Analytics
     icon: chart
-    elevator_pitch: Iceberg + StarRocks for sub-second BI without a data team.
+    elevator_pitch: Iceberg + StarRocks + Superset for sub-second BI without a data team.
     persona: Growth-stage startup / first data hire
     intended_for: ["BI teams", "product analytics", "investor dashboards"]
     anti_use_cases: ["regulated data", "streaming-first workloads"]
-    recommended_set: udp-recommended
+    recommended_set: startup-analytics
     readiness: pilot
-    hero_use_cases: ["Open analytics without managed-warehouse pricing", "Same lakehouse for ELT + BI"]
-    pending_components:
-      - { name: Dagster, role: orchestration, eta: v0.4, reason: "Asset-first scheduling for ELT" }
+    validated: true
+    hero_use_cases: ["Superset dashboards on StarRocks", "Open analytics without managed-warehouse pricing"]
+    pending_components: []
     compliance_tags: []
 
   - id: ai_research
     label: AI / ML Research
     icon: sparkles
-    elevator_pitch: Iceberg as feature-store substrate, Spark for training pulls.
+    elevator_pitch: Iceberg as feature-store substrate, Spark for training pulls, JupyterLab for notebooks.
     persona: ML team / research lab
     intended_for: ["feature engineering", "experiment tracking infra", "training-data versioning"]
     anti_use_cases: ["low-latency online serving"]
-    recommended_set: udp-recommended
+    recommended_set: ai-ml-research
     readiness: pilot
-    hero_use_cases: ["Versioned datasets via Iceberg snapshots", "Multi-engine reads from one warehouse"]
-    pending_components:
-      - { name: "JupyterHub (multi-user)", role: notebook, eta: v0.5, reason: "Shared research environment" }
-      - { name: MLflow, role: tracking, eta: v0.6, reason: "Experiment tracking + model registry" }
+    validated: true
+    hero_use_cases: ["Versioned feature datasets via Iceberg snapshots", "PySpark notebooks with MinIO S3 access"]
+    pending_components: []
     compliance_tags: []
 
   - id: healthcare
     label: Healthcare Lakehouse
     icon: shield
-    elevator_pitch: Air-gapped lakehouse framing with HIPAA-adjacent notes — not certified PHI-ready.
+    elevator_pitch: On-prem HDFS lakehouse with Hive + Hudi + Trino, Ranger authorization — HIPAA-adjacent, not certified PHI-ready.
     persona: Hospital IT / regulated-industry data platform
     intended_for: ["on-prem analytics", "data-residency requirements"]
     anti_use_cases: ["live PHI without your own BAA + controls"]
-    recommended_set: udp-recommended
+    recommended_set: healthcare-lakehouse
     readiness: pilot
-    hero_use_cases: ["Open analytics on infrastructure you control", "Audit-friendly storage substrate"]
-    pending_components:
-      - { name: "TLS-by-default profile", role: security, eta: v0.4, reason: "Encrypt all service ports out of the box" }
-      - { name: "Audit-log shipper", role: observability, eta: v0.5, reason: "Stream events to SIEM" }
-      - { name: "Polaris / Lakekeeper RBAC", role: catalog, eta: v0.5, reason: "Per-table access control" }
+    validated: true
+    hero_use_cases: ["Ranger unified authorization across HDFS + Hive + Trino", "Fully on-prem — runs on infrastructure you control"]
+    pending_components: []
     compliance_tags: [hipaa]
 
   - id: fintech_compliance
     label: Fintech Compliance
     icon: building
-    elevator_pitch: Open-format lakehouse with audit-trail framing — PCI/SOX validation pending.
+    elevator_pitch: Open-format lakehouse with audit-trail framing — Iceberg snapshots + OpenLineage data lineage.
     persona: BFSI data platform / compliance-conscious fintech
     intended_for: ["regulated analytics", "audit-trail-first deployments"]
     anti_use_cases: ["raw cardholder-data storage without tokenization upstream"]
-    recommended_set: udp-recommended
+    recommended_set: fintech-compliance
     readiness: pilot
-    hero_use_cases: ["Snapshot-based audit history (Iceberg)", "Self-hosted analytics — no third-party data plane"]
-    pending_components:
-      - { name: "Nessie (branching catalog)", role: catalog, eta: v0.5, reason: "Point-in-time audit + rollback semantics" }
-      - { name: "WORM bucket policy", role: object_storage, eta: v0.5, reason: "Immutable audit logs" }
+    validated: true
+    hero_use_cases: ["Full data lineage via OpenLineage/Marquez", "Snapshot-based audit history (Iceberg)"]
+    pending_components: []
     compliance_tags: [pci_dss, soc2]
 
   - id: enterprise_onprem_datalake
     label: Enterprise On-Prem Datalake
     icon: server
-    elevator_pitch: Production-grade multi-engine datalake on bare-metal — HDFS storage, Hive+Tez batch SQL, Spark+Hudi ingest, StarRocks sub-second OLAP, Trino federated SQL, Ranger unified authorization.
+    elevator_pitch: Production-grade multi-engine datalake — HDFS + Hive + Spark + Hudi + StarRocks + Trino + Airflow.
     persona: Enterprise data engineering team / on-prem platform
     intended_for: ["production on-premises deployments", "regulated-industry data platforms", "multi-engine enterprise datalakes"]
-    anti_use_cases: ["single-node laptops", "pure cloud deployments", "teams without bare-metal infra"]
-    recommended_set: enterprise-hadoop-docker-recommended
-    stack_id: enterprise-hadoop-v1.0
+    anti_use_cases: ["pure cloud deployments", "teams without bare-metal infra"]
+    recommended_set: enterprise-onprem
     readiness: pilot
+    validated: true
     hero_use_cases:
       - "Full enterprise datalake in Docker — HDFS + YARN + Hive + Spark + Hudi + StarRocks + Trino + Airflow"
-      - "Connect Studio to an existing running bare-metal Hadoop datalake"
       - "Multi-engine reads: Hive (batch), Spark (ETL), StarRocks (OLAP), Trino (federated)"
       - "Incremental ingest via Spark + Hudi with ACID upserts"
-      - "Unified authorization across all engines via Apache Ranger"
     pending_components: []
     compliance_tags: []
-    mode: remote-cluster
 
   - id: streaming
     label: Streaming Lakehouse
     icon: bolt
-    elevator_pitch: CDC-into-Iceberg architecture preview — streaming engines coming Q3.
+    elevator_pitch: Real-time CDC-into-Iceberg — Kafka event bus + Flink streaming compute + Iceberg sink.
     persona: Engineering team building on event data
-    intended_for: ["preview / architecture sketches", "CDC-into-lakehouse planning"]
-    anti_use_cases: ["live streaming pipelines today — pending Flink/Kafka v0.5"]
-    recommended_set: udp-recommended
-    readiness: preview
-    hero_use_cases: ["See the target shape before v0.5 streaming lands", "Validate Iceberg-as-sink plumbing"]
-    pending_components:
-      - { name: "Apache Kafka", role: streaming, eta: v0.5, reason: "Event bus + CDC source" }
-      - { name: "Schema Registry", role: streaming, eta: v0.5, reason: "Avro/JSON contract enforcement" }
-      - { name: "Apache Flink", role: processing, eta: v0.5, reason: "Streaming compute, Iceberg sink" }
+    intended_for: ["CDC-into-lakehouse", "event-driven analytics", "real-time pipelines"]
+    anti_use_cases: ["sub-second OLTP"]
+    recommended_set: streaming-lakehouse
+    readiness: pilot
+    validated: true
+    hero_use_cases: ["Kafka → Flink → Iceberg streaming pipeline", "Sub-minute data freshness in your lakehouse"]
+    pending_components: []
     compliance_tags: []
 
 categories:
@@ -1534,6 +1529,30 @@ categories:
     coming_soon:
       - { name: "Marquez", id: "marquez", logo: "/assets/logos/marquez.svg", summary: "Reference OpenLineage backend with a web UI for lineage exploration.", reason: "Reference backend; v0.7" }
       - { name: "DataHub", id: "datahub", logo: "/assets/logos/datahub.svg", summary: "Full data catalog + lineage + governance platform from LinkedIn.",        reason: "Catalog + lineage; v0.8" }
+
+  - id: ai_ml
+    label: AI / ML notebooks (optional)
+    description: Interactive notebooks for feature engineering, training-data pulls, and ad-hoc analysis against lakehouse tables.
+    order: 12
+    optional: true
+    components:
+      - id: jupyter
+        name: JupyterLab (PySpark + Iceberg)
+        version: "spark-3.5.0"
+        maturity: ga
+        recommended: false
+        status_badge: "Candidate"
+        badges: [Candidate, Optional]
+        compatible: true
+        license: BSD-3-Clause
+        maintainer: Project Jupyter
+        url: https://jupyter.org
+        summary: JupyterLab with PySpark, the Iceberg Spark runtime, and MinIO S3 credentials pre-wired. Read and write lakehouse tables from notebooks.
+        compatible_with: [spark-iceberg, iceberg-rest, minio, trino]
+        logo: "/assets/logos/jupyter.svg"
+        tagline: "PySpark + Iceberg notebooks with MinIO S3 access out of the box."
+        why_this_version: "jupyter/all-spark-notebook pinned to spark-3.5.0 to match the spark-iceberg 3.5.x runtime in the certified stacks."
+        resource_profile_summary: "Single notebook server. ~1-2 GB idle; scales with notebook workloads (Spark runs in local mode inside the container)."
 
 # ============================================================
 # Enterprise On-Prem Datalake components (remote-cluster mode)

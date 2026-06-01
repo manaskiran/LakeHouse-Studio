@@ -70,11 +70,10 @@ components:
   - id: trino
     name: Trino
     category: processing
-    # Same Trino 475 pin as udp-trino-local-v0.1 — picked for its
-    # in-market maturity around Iceberg-REST + MinIO. Nessie exposes
-    # the same Iceberg REST surface, so the same Trino release applies.
-    version: "475"
-    image: trinodb/trino:475
+    # Trino 481 — bumped from 475 on 2026-05-27. Nessie exposes the
+    # same Iceberg REST surface as the REST catalog; same release applies.
+    version: "481"
+    image: trinodb/trino:481
     service_name: trino
     ports: [8080]
     resource_profiles:

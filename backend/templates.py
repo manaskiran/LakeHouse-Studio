@@ -37,6 +37,7 @@ def list_templates() -> list[dict[str, Any]]:
             "elevator_pitch": t.get("elevator_pitch"),
             "persona": t.get("persona"),
             "readiness": t.get("readiness", "pilot"),
+            "validated": bool(t.get("validated", False)),
             "compliance_tags": list(t.get("compliance_tags") or []),
             "pending_count": len(t.get("pending_components") or []),
         })

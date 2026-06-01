@@ -182,6 +182,7 @@
     @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
     .step-running { background: linear-gradient(90deg, rgba(34,211,238,0.06) 0%, rgba(168,85,247,0.18) 50%, rgba(236,72,153,0.06) 100%); background-size: 200% 100%; animation: shimmer 2s linear infinite; }
     @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    @keyframes cascadeToastIn { from { opacity: 0; transform: translateX(-50%) translateY(16px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
     .scroll-shadow { box-shadow: inset 0 -10px 12px -10px rgba(0,0,0,0.4), inset 0 10px 12px -10px rgba(0,0,0,0.4); }
 
     /* ---------------- CUSTOM PIPELINE ---------------- */
@@ -625,6 +626,354 @@
   </div>
 </div>
 
+<!-- Image Build Modal -->
+<div id="img-build-modal" class="hidden fixed inset-0 z-[110] flex items-center justify-center p-4" style="background:rgba(7,6,26,0.82);backdrop-filter:blur(8px)">
+  <div class="glass w-full max-w-lg p-6" style="border-color:rgba(16,185,129,0.25)">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h3 id="ibm-title" class="text-base font-semibold text-slate-100">Build Custom Image</h3>
+        <div id="ibm-subtitle" class="text-xs text-slate-400 mt-0.5 mono"></div>
+      </div>
+      <button id="ibm-close" class="text-slate-400 hover:text-white text-xl leading-none">×</button>
+    </div>
+
+    <!-- Phase: research -->
+    <div id="ibm-phase-research" class="hidden">
+      <div class="flex items-center gap-2 text-sm text-emerald-300 mb-3">
+        <span id="ibm-research-spinner" style="animation:pulse 1s infinite;display:inline-block">✦</span>
+        <span>AI researching best compatible version…</span>
+      </div>
+    </div>
+
+    <!-- Phase: confirm -->
+    <div id="ibm-phase-confirm" class="hidden">
+      <div class="rounded-lg p-4 mb-4" style="background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.2)">
+        <div class="text-xs text-slate-400 mb-2 uppercase tracking-wider">AI Recommendation</div>
+        <div class="mono text-sm text-emerald-300" id="ibm-rec-image"></div>
+        <div class="text-xs text-slate-400 mt-2" id="ibm-rec-reason"></div>
+        <div class="grid grid-cols-2 gap-3 mt-3 text-xs">
+          <div><span class="text-slate-500">Spark base</span><br><span class="mono text-slate-200" id="ibm-rec-spark"></span></div>
+          <div><span class="text-slate-500" id="ibm-rec-addon-label">Addon</span><br><span class="mono text-slate-200" id="ibm-rec-addon"></span></div>
+        </div>
+      </div>
+      <div class="flex gap-2 justify-end">
+        <button id="ibm-cancel" class="btn-ghost text-sm">Cancel</button>
+        <button id="ibm-build-btn" class="text-sm px-4 py-1.5 rounded font-medium" style="background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7">⚙ Build &amp; Push</button>
+      </div>
+    </div>
+
+    <!-- Phase: building -->
+    <div id="ibm-phase-build" class="hidden">
+      <div class="flex items-center gap-2 text-xs text-slate-400 mb-2">
+        <span id="ibm-build-status" class="mono text-emerald-400">building…</span>
+      </div>
+      <div id="ibm-log" class="font-mono text-xs overflow-y-auto rounded p-3"
+        style="max-height:240px;background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.07);color:#94a3b8;line-height:1.6"></div>
+      <div id="ibm-build-footer" class="hidden mt-3 flex gap-2 justify-end">
+        <button id="ibm-done-btn" class="btn-ghost text-sm">Close</button>
+      </div>
+    </div>
+
+    <!-- Phase: error -->
+    <div id="ibm-phase-error" class="hidden">
+      <div class="text-sm text-rose-300 mb-2" id="ibm-error-msg"></div>
+      <div class="flex justify-end">
+        <button id="ibm-err-close" class="btn-ghost text-sm">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============== AI PROVISION MODAL ============== -->
+<div id="ai-prov-modal" class="hidden fixed inset-0 z-[120] flex items-center justify-center p-4"
+     style="background:rgba(7,6,26,0.88);backdrop-filter:blur(10px)">
+  <div class="glass w-full max-w-2xl p-6" style="border-color:rgba(168,85,247,0.3)">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-5">
+      <div>
+        <h3 class="text-base font-semibold text-slate-100 flex items-center gap-2">
+          <span style="color:#a855f7">✦</span> AI Lakehouse Builder
+        </h3>
+        <div id="aip-subtitle" class="text-xs text-slate-400 mt-0.5 mono"></div>
+      </div>
+      <button id="aip-close" class="text-slate-400 hover:text-white text-xl leading-none">×</button>
+    </div>
+
+    <!-- Phase progress tracker -->
+    <div id="aip-phases" class="grid grid-cols-3 gap-2 mb-5">
+      <!-- Populated by JS -->
+    </div>
+
+    <!-- Log stream -->
+    <div id="aip-log"
+         class="font-mono text-xs overflow-y-auto rounded p-3 mb-4"
+         style="height:220px;background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.07);color:#94a3b8;line-height:1.7">
+      <div id="aip-log-inner"></div>
+    </div>
+
+    <!-- Connection summary (revealed on completion) -->
+    <div id="aip-summary" class="hidden">
+      <div class="rounded-lg p-4 mb-4" style="background:rgba(168,85,247,0.07);border:1px solid rgba(168,85,247,0.22)">
+        <div class="text-xs text-slate-400 mb-3 uppercase tracking-wider">🎉 Lakehouse Ready</div>
+        <div id="aip-endpoints" class="grid grid-cols-2 gap-x-6 gap-y-2 text-xs mb-4"></div>
+        <div id="aip-pipeline-wrap" class="hidden">
+          <div class="text-xs text-slate-400 mb-1 uppercase tracking-wider">Pipeline starter</div>
+          <pre id="aip-pipeline-code" class="mono text-xs rounded p-3 overflow-x-auto"
+               style="background:rgba(0,0,0,0.4);color:#a5b4fc;border:1px solid rgba(99,102,241,0.2)"></pre>
+        </div>
+      </div>
+      <div class="flex justify-end gap-2">
+        <button id="aip-done-btn" class="btn-primary text-sm">Done →</button>
+      </div>
+    </div>
+
+    <!-- Error state -->
+    <div id="aip-error" class="hidden">
+      <div class="text-sm text-rose-300 mb-3 rounded p-3" style="background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.25)"
+           id="aip-error-msg"></div>
+      <div class="flex justify-end">
+        <button id="aip-err-close" class="btn-ghost text-sm">Close</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     STACK BUILDER MODAL — wedaa-style custom lakehouse factory
+     ═══════════════════════════════════════════════════════════════════════ -->
+<div id="sb-modal" class="hidden fixed inset-0 z-[130]"
+     style="background:rgba(5,4,20,0.92);backdrop-filter:blur(12px)">
+  <div class="h-full flex flex-col">
+
+    <!-- Header bar -->
+    <div class="flex items-center justify-between px-6 py-4 shrink-0"
+         style="border-bottom:1px solid rgba(168,85,247,0.25);background:rgba(10,9,35,0.7)">
+      <div class="flex items-center gap-3">
+        <span style="font-size:1.4rem">✦</span>
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-tight">Stack Builder</h2>
+          <p class="text-xs text-slate-400">Pick components → AI generates configs + starts your lakehouse</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <button id="sb-preview-btn" class="text-xs px-3 py-1.5 rounded-lg hidden"
+                style="background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);color:#a5b4fc">
+          Preview compose.yml
+        </button>
+        <button id="sb-build-btn" class="text-sm px-5 py-2 rounded-lg font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
+                style="background:linear-gradient(135deg,#7c3aed,#be185d);color:#fff;box-shadow:0 0 20px rgba(168,85,247,0.3)"
+                disabled>
+          ✦ AI Build
+        </button>
+        <button id="sb-close" class="text-slate-400 hover:text-white text-2xl leading-none ml-2">×</button>
+      </div>
+    </div>
+
+    <!-- Body: 3-column layout -->
+    <div class="flex-1 flex overflow-hidden">
+
+      <!-- LEFT: Component Picker (scrollable) -->
+      <div class="w-[340px] shrink-0 overflow-y-auto border-r" style="border-color:rgba(255,255,255,0.06);background:rgba(8,7,28,0.5)">
+        <div class="px-4 pt-4 pb-2">
+          <input id="sb-search" type="text" placeholder="Search components…"
+                 class="w-full text-sm px-3 py-2 rounded-lg mono"
+                 style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;outline:none">
+        </div>
+        <div id="sb-catalog" class="px-3 pb-4 space-y-4">
+          <!-- populated by JS -->
+        </div>
+      </div>
+
+      <!-- CENTER: Selected stack + auto-deps -->
+      <div class="flex-1 overflow-y-auto px-6 py-4">
+        <div class="max-w-2xl mx-auto">
+
+          <!-- Stack name -->
+          <div class="mb-5">
+            <label class="text-xs text-slate-400 uppercase tracking-wider block mb-1.5">Stack name</label>
+            <input id="sb-stack-name" type="text" value="custom-lakehouse"
+                   class="text-sm px-3 py-2 rounded-lg mono w-full"
+                   style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;outline:none">
+          </div>
+
+          <!-- Selected components -->
+          <div class="mb-5">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs text-slate-400 uppercase tracking-wider">Selected components</span>
+              <span id="sb-count" class="text-xs text-slate-500">0 selected</span>
+            </div>
+            <div id="sb-selected-list" class="space-y-1.5">
+              <div class="text-sm text-slate-500 italic py-4 text-center">Pick components from the left panel</div>
+            </div>
+          </div>
+
+          <!-- Auto-added deps -->
+          <div id="sb-auto-section" class="hidden mb-5">
+            <div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Auto-added dependencies</div>
+            <div id="sb-auto-list" class="flex flex-wrap gap-1.5"></div>
+          </div>
+
+          <!-- Version overrides (expandable) -->
+          <div class="mb-5">
+            <button id="sb-versions-toggle" class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1 hover:text-slate-200 transition-colors">
+              <span id="sb-versions-arrow">▶</span> Version overrides
+            </button>
+            <div id="sb-versions-panel" class="hidden mt-3 space-y-2">
+              <div class="text-xs text-slate-500 italic">Select components first to see version pickers</div>
+            </div>
+          </div>
+
+          <!-- Conflict warnings -->
+          <div id="sb-conflicts" class="hidden mb-4 text-sm text-amber-300 rounded-lg p-3"
+               style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.25)">
+          </div>
+
+        </div>
+      </div>
+
+      <!-- RIGHT: Compose preview panel -->
+      <div id="sb-compose-panel" class="hidden w-[400px] shrink-0 overflow-y-auto border-l"
+           style="border-color:rgba(255,255,255,0.06);background:rgba(8,7,28,0.6)">
+        <div class="px-4 py-3 flex items-center justify-between"
+             style="border-bottom:1px solid rgba(255,255,255,0.06)">
+          <span class="text-xs text-slate-300 font-semibold uppercase tracking-wider">docker-compose.yml preview</span>
+          <button id="sb-compose-copy" class="text-xs text-slate-400 hover:text-slate-200">copy</button>
+        </div>
+        <pre id="sb-compose-code" class="text-xs mono overflow-auto px-4 py-3"
+             style="color:#a5b4fc;line-height:1.6;white-space:pre"></pre>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Pre-Install Dialog — review components + add tools + choose target -->
+<div id="preinstall-modal" class="hidden fixed inset-0 z-[145] flex items-center justify-center p-4"
+     style="background:rgba(7,6,26,0.88);backdrop-filter:blur(10px)">
+  <div class="glass w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto" style="border-color:rgba(34,211,238,0.3)">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h3 class="text-base font-semibold text-slate-100 flex items-center gap-2">
+          <span style="color:#22d3ee">⚡</span> Install <span id="pi-card-label"></span>
+        </h3>
+        <div class="text-xs text-slate-400 mt-0.5">Review the stack, add tools, and choose where to install.</div>
+      </div>
+      <button id="pi-close" class="text-slate-400 hover:text-white text-xl leading-none">×</button>
+    </div>
+
+    <!-- Components -->
+    <div class="mb-4">
+      <div class="text-xs uppercase tracking-wide text-slate-400 mb-2">Tools to install</div>
+      <div id="pi-components" class="flex flex-wrap gap-2"></div>
+    </div>
+
+    <!-- Add tools -->
+    <div class="mb-5">
+      <div class="text-xs uppercase tracking-wide text-slate-400 mb-2">Add more tools</div>
+      <select id="pi-add-select" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-2 text-sm text-slate-200">
+        <option value="">+ Add a component…</option>
+      </select>
+    </div>
+
+    <!-- Target -->
+    <div class="mb-4">
+      <div class="text-xs uppercase tracking-wide text-slate-400 mb-2">Where should this install?</div>
+      <div class="flex gap-2 mb-3">
+        <button id="pi-target-local" class="btn-primary text-xs flex-1">💻 This machine (localhost)</button>
+        <button id="pi-target-remote" class="btn-ghost text-xs flex-1">🖥 Remote server (SSH)</button>
+      </div>
+      <div id="pi-remote-fields" class="hidden space-y-2">
+        <div>
+          <label class="text-xs text-slate-400">Host *</label>
+          <input id="pi-host" placeholder="e.g. 78.47.4.112" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+          <div class="text-[11px] text-slate-500 mt-0.5">Used to render service URLs after install (e.g. http://&lt;host&gt;:9001).</div>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-xs text-slate-400">SSH user *</label>
+            <input id="pi-ssh-user" placeholder="e.g. hadoop" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+          </div>
+          <div>
+            <label class="text-xs text-slate-400">SSH port</label>
+            <input id="pi-ssh-port" value="22" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400">Private key path (on this machine, optional)</label>
+          <input id="pi-ssh-key" placeholder="e.g. /home/hadoop/.ssh/id_rsa  (default key if empty)" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400">SSH password (optional — key auth preferred)</label>
+          <input id="pi-ssh-pass" type="password" placeholder="Leave empty to use key-based auth" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400">Install directory</label>
+          <input id="pi-install-dir" placeholder="(default: lakehouse-studio/&lt;stack&gt;)" class="w-full bg-slate-800/60 border border-slate-600 rounded px-3 py-1.5 text-sm text-slate-200">
+          <div class="text-[11px] text-slate-500 mt-0.5">Where the stack is cloned and run on the remote host.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-700">
+      <button id="pi-cancel" class="btn-ghost text-sm">Cancel</button>
+      <button id="pi-go" class="btn-primary text-sm">Install →</button>
+    </div>
+  </div>
+</div>
+
+<!-- Stack Builder — Build Progress Modal -->
+<div id="sb-progress-modal" class="hidden fixed inset-0 z-[140] flex items-center justify-center p-4"
+     style="background:rgba(7,6,26,0.88);backdrop-filter:blur(10px)">
+  <div class="glass w-full max-w-2xl p-6" style="border-color:rgba(168,85,247,0.3)">
+
+    <div class="flex items-center justify-between mb-5">
+      <div>
+        <h3 class="text-base font-semibold text-slate-100 flex items-center gap-2">
+          <span style="color:#a855f7">✦</span> Building Lakehouse
+        </h3>
+        <div id="sb-prog-subtitle" class="text-xs text-slate-400 mt-0.5 mono"></div>
+      </div>
+      <button id="sb-prog-close" class="text-slate-400 hover:text-white text-xl leading-none hidden">×</button>
+    </div>
+
+    <div id="sb-prog-phases" class="grid grid-cols-4 gap-2 mb-5 text-center"></div>
+
+    <div id="sb-prog-log"
+         class="font-mono text-xs overflow-y-auto rounded p-3 mb-4"
+         style="height:240px;background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.07);color:#94a3b8;line-height:1.7">
+      <div id="sb-prog-log-inner"></div>
+    </div>
+
+    <div id="sb-prog-summary" class="hidden">
+      <div class="rounded-lg p-4 mb-4" style="background:rgba(168,85,247,0.07);border:1px solid rgba(168,85,247,0.22)">
+        <div class="text-xs text-slate-400 mb-3 uppercase tracking-wider">🎉 Lakehouse Ready</div>
+        <div id="sb-prog-endpoints" class="grid grid-cols-2 gap-x-6 gap-y-2 text-xs mb-4"></div>
+        <div id="sb-prog-pipeline-wrap" class="hidden">
+          <div class="text-xs text-slate-400 mb-1 uppercase tracking-wider">Pipeline starter</div>
+          <pre id="sb-prog-pipeline-code" class="mono text-xs rounded p-3 overflow-x-auto"
+               style="background:rgba(0,0,0,0.4);color:#a5b4fc;border:1px solid rgba(99,102,241,0.2)"></pre>
+        </div>
+      </div>
+      <div class="flex justify-end">
+        <button id="sb-prog-done-btn" class="btn-primary text-sm">Done →</button>
+      </div>
+    </div>
+
+    <div id="sb-prog-error" class="hidden">
+      <div class="text-sm text-rose-300 mb-3 rounded p-3"
+           style="background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.25)"
+           id="sb-prog-error-msg"></div>
+      <div class="flex gap-2 justify-end">
+        <button id="sb-prog-err-retry" class="btn-primary text-sm">↻ Try Again</button>
+        <button id="sb-prog-err-close" class="btn-ghost text-sm">Close</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
 <!-- Top status bar (fixed) -->
 <div class="statusbar"><div class="dot" id="status-dot"></div><span class="mono" id="status-text">studio · v0.3</span></div>
 
@@ -671,9 +1020,9 @@
     </div>
     <nav class="flex items-center gap-1 text-sm">
       <button data-nav="welcome"  class="nav-btn px-3 py-1.5 rounded-lg text-slate-300 hover:bg-white/5">Home</button>
+      <button data-nav="quick-install" class="nav-btn px-3 py-1.5 rounded-lg text-slate-300 hover:bg-white/5">Quick Install</button>
       <button data-nav="installs" class="nav-btn px-3 py-1.5 rounded-lg text-slate-300 hover:bg-white/5">Installs</button>
       <button data-nav="settings" class="nav-btn px-3 py-1.5 rounded-lg text-slate-300 hover:bg-white/5">Settings</button>
-      <a href="https://github.com/finalertserats-prog/Lakehouse-Studio-udp-cart" target="_blank" class="px-3 py-1.5 rounded-lg text-slate-400 hover:text-slate-200">GitHub <span class="text-xs">↗</span></a>
     </nav>
   </div>
 </header>
@@ -717,8 +1066,12 @@
         <p class="text-lg text-slate-400 max-w-xl mb-8 leading-relaxed">
           Shop components, size your server, click install. Studio drives the whole stack — MinIO, Iceberg, Spark, StarRocks — with a live demo query on the other side.
         </p>
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-3 flex-wrap">
           <button id="btn-start" class="btn-primary text-base">Start install <span class="ml-2">→</span></button>
+          <button id="btn-stack-builder" class="text-sm px-4 py-2 rounded-lg font-semibold flex items-center gap-1.5 transition-all"
+            style="background:linear-gradient(135deg,rgba(124,58,237,0.18),rgba(236,72,153,0.18));border:1px solid rgba(168,85,247,0.35);color:#d8b4fe">
+            ✦ Stack Builder
+          </button>
           <button id="btn-how" class="btn-ghost text-sm">See how it works</button>
         </div>
         <div class="flex items-center gap-6 mt-10 text-xs text-slate-500">
@@ -828,6 +1181,16 @@
       <span id="picker-toggle-label-classic" class="hidden">Switched to classic goals.</span>
       <button id="btn-classic-goals" class="text-cyan-400 hover:text-cyan-300 underline-offset-2 hover:underline">Show classic goals</button>
     </div>
+  </section>
+
+  <!-- ============== QUICK INSTALL ============== -->
+  <section id="screen-quick-install" class="screen hidden fade-up">
+    <div class="mb-8">
+      <div class="text-xs uppercase tracking-widest text-slate-500 mb-2">One click</div>
+      <h2 class="display-2 grad-text-soft inline-block">Quick Install</h2>
+      <p class="text-slate-400 mt-2">Pick a template and deploy the full stack in one click — no cart, no steps. Want to inspect or customise first? Use the template picker on Home.</p>
+    </div>
+    <div id="qi-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
   </section>
 
   <!-- ============== BUILD (cart) ============== -->
@@ -1050,6 +1413,11 @@
     <div id="inspect-checks" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
     <div class="flex items-center gap-3 mt-8">
       <button id="btn-install" class="btn-primary">Install <span class="ml-1">→</span></button>
+      <button id="btn-ai-build" class="text-sm px-4 py-2 rounded-lg font-medium flex items-center gap-1.5"
+              style="background:rgba(168,85,247,0.15);border:1px solid rgba(168,85,247,0.35);color:#c4b5fd"
+              title="AI researches versions, generates all configs, installs, and verifies end-to-end">
+        ✦ AI Build
+      </button>
       <button class="btn-ghost" onclick="runInspect()">↻ Re-run</button>
     </div>
   </section>
@@ -1690,6 +2058,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     sshKeyPath: "",
     sshPassword: "",
     selectedVersions: {},
+    dynamicVersions: {},       // compId → [{version, label, release_date, source}, ...]
+    versionsLoading: new Set(), // compIds currently being fetched
+    compatRules: [],            // loaded once from /api/compat-rules
   };
 
   // Phase mapping for the top stepper
@@ -1726,6 +2097,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     });
     setStepper(screen);
     if (screen === "installs") loadInstalls();
+    if (screen === "quick-install") loadQuickInstall();
     if (screen !== "success" && typeof stopHealthPolling === "function") stopHealthPolling();
     if (screen === "server") {
       const installDir = state.selected?.install_dir || "udp";
@@ -1782,6 +2154,11 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
   function _invalidateSpotRects() { _spotRectsValid = false; }
   window.addEventListener("scroll", _invalidateSpotRects, { passive: true });
   window.addEventListener("resize", _invalidateSpotRects, { passive: true });
+
+  // Close any open version panel when clicking outside
+  document.addEventListener("click", () => {
+    document.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
+  });
   // Coarse invalidation when the screen changes (different DOM)
   const _origNavigate = window.navigate;  // will rebind below; placeholder
   function _refreshSpotRects() {
@@ -2010,9 +2387,24 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     }
   }
 
-  function renderTemplateCards(templates) {
+  // Quick Install tab: render every installable template with a one-click ⚡ Install.
+  async function loadQuickInstall() {
+    if (!state.catalog) { try { state.catalog = await api("/api/catalog"); } catch (_) {} }
+    let templates = [];
+    try {
+      const r = await api("/api/templates");
+      templates = r?.templates || [];
+    } catch (_) { templates = []; }
+    renderTemplateCards(templates, { listId: "qi-list", mode: "install" });
+  }
+
+  function renderTemplateCards(templates, opts = {}) {
+    // mode "review" (default): whole card → review/build page, no Install button.
+    // mode "install": one-click ⚡ Install button (used by the Quick Install tab).
+    const listId = opts.listId || "goal-list";
+    const mode = opts.mode || "review";
     state._lastTemplates = templates;
-    const list = document.getElementById("goal-list"); list.innerHTML = "";
+    const list = document.getElementById(listId); list.innerHTML = "";
     templates.forEach(t => {
       const div = document.createElement("div");
       const installable = t.readiness !== "preview";
@@ -2023,6 +2415,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       const pendingBadge = t.pending_count > 0
         ? `<span class="badge" style="background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.35); color: #fcd34d;">${t.pending_count} pending</span>`
         : `<span class="badge badge-stable">all certified</span>`;
+      const testedBadge = t.validated
+        ? `<span class="badge" style="background: rgba(52,211,153,0.14); border-color: rgba(52,211,153,0.4); color: #6ee7b7;">✓ E2E tested</span>`
+        : `<span class="badge" style="background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.35); color: #cbd5e1;">untested</span>`;
       const readinessBadge = t.readiness === "preview"
         ? `<span class="badge" style="background: rgba(168,85,247,0.12); border-color: rgba(168,85,247,0.35); color: #d8b4fe;">PREVIEW</span>`
         : "";
@@ -2034,13 +2429,30 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
         <div class="display-3 mb-1">${esc(t.label)}</div>
         <div class="text-sm text-slate-400 mb-3 leading-relaxed">${esc(t.elevator_pitch || "")}</div>
         <div class="text-xs text-slate-500 mb-3">${esc(t.persona || "")}</div>
-        <div class="flex flex-wrap gap-1 mb-3">${pendingBadge}${tags}</div>
-        <div class="text-xs ${installable ? "text-cyan-300" : "text-slate-500"} mt-2 flex items-center gap-1">
-          ${installable ? "Choose <span>→</span>" : "Preview only — coming v0.5"}
+        <div class="flex flex-wrap gap-1 mb-3">${testedBadge}${pendingBadge}${tags}</div>
+        <div class="flex items-center gap-2 mt-3">
+          ${installable
+            ? (mode === "install"
+                ? `<button class="btn-primary text-xs sb-install-btn" data-tid="${esc(t.id)}">⚡ Install</button>`
+                : `<button class="btn-ghost text-xs sb-review-btn" data-tid="${esc(t.id)}">Review →</button>`)
+            : `<span class="text-xs text-slate-500">Preview only — coming v0.5</span>`}
         </div>
       `;
       if (installable) {
-        div.addEventListener("click", () => pickTemplate(t.id));
+        if (mode === "install") {
+          // Quick Install tab: one-click build through the Stack Builder pipeline.
+          div.querySelector(".sb-install-btn").addEventListener("click", (e) => {
+            e.stopPropagation();
+            _sbInstallTemplate(t.id, t.label);
+          });
+        } else {
+          // Picker: clicking anywhere on the card lands on the review/build page.
+          div.addEventListener("click", () => pickTemplate(t.id));
+          div.querySelector(".sb-review-btn").addEventListener("click", (e) => {
+            e.stopPropagation();
+            pickTemplate(t.id);
+          });
+        }
       }
       list.appendChild(div);
     });
@@ -2140,6 +2552,8 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     renderCatalog();
     renderTemplateBanner();
     await refreshCartValidation();
+    // Load dynamic versions in the background (non-blocking)
+    loadAllCatalogVersions().catch(e => console.warn("loadAllCatalogVersions failed", e));
   }
 
   function renderTemplateBanner() {
@@ -2235,29 +2649,82 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     });
   }
 
+  // ---- Version helpers (dynamic + catalog fallback) ----
+
+  function _getAllKnownVersions(compId) {
+    // Returns all known version strings for a component (dynamic + catalog static)
+    const versions = [];
+    const seen = new Set();
+    for (const v of (state.dynamicVersions[compId] || [])) {
+      if (!seen.has(v.version)) { versions.push(v.version); seen.add(v.version); }
+    }
+    const comp = _findComponent(compId);
+    for (const opt of (comp?.version_options || [])) {
+      const vs = String(opt.version);
+      if (!seen.has(vs)) { versions.push(vs); seen.add(vs); }
+    }
+    return versions;
+  }
+
+  function _matchVersionPattern(version, pattern) {
+    // fnmatch-style: 3.4.* → regex ^3\.4\..*$   46* → ^46.*$
+    const reStr = '^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
+    return new RegExp(reStr).test(version);
+  }
+
+  function _baseVersion(v) {
+    // "3.5.5_1.8.1" → "3.5.5",  "3.4.1" → "3.4.1"
+    return v.split(/[_+]/)[0];
+  }
+
   function _getSelectedVersion(compId) {
     if (state.selectedVersions[compId]) return state.selectedVersions[compId];
+    // Prefer dynamic default
+    const dynDef = (state.dynamicVersions[compId] || []).find(v => v.default);
+    if (dynDef) return dynDef.version;
     const comp = _findComponent(compId);
     if (!comp) return null;
     if (comp.version_options) {
       const def = comp.version_options.find(o => o.default);
-      if (def) return def.version;
-      if (comp.version_options[0]) return comp.version_options[0].version;
+      if (def) return String(def.version);
+      if (comp.version_options[0]) return String(comp.version_options[0].version);
     }
-    return comp.version || null;
+    return comp.version ? String(comp.version) : null;
   }
 
   function _getAllowedVersions(compId) {
-    // Returns a Set of allowed versions based on active cascade anchor selections,
-    // or null when no constraint applies.
+    // Returns a Set<string> of allowed version strings for compId given current anchor
+    // selections, or null when no constraint applies.
     let allowed = null;
+
     (state.catalog.categories || []).forEach(cat => {
       (cat.components || []).forEach(anchor => {
+        const anchorVer = _getSelectedVersion(anchor.id);
+        if (!anchorVer) return;
+        const baseAnchorVer = _baseVersion(anchorVer);
+
+        // ── Dynamic compat rules (from /api/compat-rules) ──────────────────
+        const rule = (state.compatRules || []).find(r =>
+          r.anchor === anchor.id && _matchVersionPattern(baseAnchorVer, r.anchor_pattern)
+        );
+        if (rule && rule.compat && rule.compat[compId]) {
+          const patterns = rule.compat[compId];
+          const allVers = _getAllKnownVersions(compId);
+          const matches = allVers.filter(v =>
+            patterns.some(pat => _matchVersionPattern(_baseVersion(v), pat))
+          );
+          if (allowed === null) {
+            allowed = new Set(matches);
+          } else {
+            allowed = new Set([...allowed].filter(v => matches.includes(v)));
+          }
+          return;
+        }
+
+        // ── Fallback: catalog static compatible_versions ───────────────────
         if (!anchor.version_options) return;
-        const selVer = state.selectedVersions[anchor.id];
-        if (!selVer) return;
-        const opt = anchor.version_options.find(o => o.version === selVer);
-        if (!opt || !opt.compatible_versions || !opt.compatible_versions[compId]) return;
+        const opt = anchor.version_options.find(o => String(o.version) === anchorVer);
+        if (!opt?.compatible_versions?.[compId]) return;
         const allowedList = opt.compatible_versions[compId];
         if (allowed === null) {
           allowed = new Set(allowedList);
@@ -2269,21 +2736,149 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     return allowed;
   }
 
+  function _bestCompatibleVersion(targetId, patterns) {
+    // Returns the newest compatible version for targetId given the compat patterns.
+    // Strategy: allVersions is sorted newest-first; take the first match.
+    const allVers = _getAllKnownVersions(targetId);
+    return allVers.find(v => patterns.some(pat => _matchVersionPattern(_baseVersion(v), pat))) || null;
+  }
+
   function applyVersionCascade(changedCompId, newVersion) {
     state.selectedVersions[changedCompId] = newVersion;
+    const baseNewVer = _baseVersion(newVersion);
+    const autoUpdated = []; // [{id, oldVersion, newVersion, compName}]
+
+    // ── Smart auto-select: scan ALL components and pick best compatible version ──
+    // When you pick an anchor (e.g. HDFS 3.4.1), every component in the compat
+    // map gets auto-updated to its best (newest) compatible version.
+    (state.compatRules || []).forEach(rule => {
+      if (rule.anchor !== changedCompId) return;
+      if (!_matchVersionPattern(baseNewVer, rule.anchor_pattern)) return;
+
+      Object.entries(rule.compat || {}).forEach(([targetId, patterns]) => {
+        const bestVer = _bestCompatibleVersion(targetId, patterns);
+        if (!bestVer) return;
+        const prevVer = state.selectedVersions[targetId];
+        if (prevVer === bestVer) return; // already on best — no change needed
+        state.selectedVersions[targetId] = bestVer;
+        const comp = _findComponent(targetId);
+        autoUpdated.push({
+          id: targetId,
+          oldVersion: prevVer,
+          newVersion: bestVer,
+          compName: comp?.name || targetId,
+        });
+      });
+    });
+
+    // ── Fallback: catalog static compatible_versions for components not in rules ──
     const changedComp = _findComponent(changedCompId);
-    if (changedComp && changedComp.version_options) {
-      const opt = changedComp.version_options.find(o => o.version === newVersion);
-      if (opt && opt.compatible_versions) {
-        for (const [targetId, allowedVersions] of Object.entries(opt.compatible_versions)) {
-          const curVer = state.selectedVersions[targetId];
-          if (curVer && !allowedVersions.includes(curVer)) {
+    if (changedComp?.version_options) {
+      const opt = changedComp.version_options.find(o => String(o.version) === newVersion);
+      if (opt?.compatible_versions) {
+        Object.entries(opt.compatible_versions).forEach(([targetId, allowedVersions]) => {
+          if (!state.selectedVersions[targetId]) {
             state.selectedVersions[targetId] = allowedVersions[0] || null;
           }
-        }
+        });
       }
     }
+
     renderCatalog();
+
+    // ── Show toast listing what was auto-selected ──────────────────────────────
+    if (autoUpdated.length > 0) {
+      _showCascadeToast(changedCompId, newVersion, autoUpdated);
+    }
+  }
+
+  function _showCascadeToast(anchorId, anchorVersion, updates, isAI = false) {
+    const prev = document.getElementById('cascade-toast');
+    if (prev) prev.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'cascade-toast';
+    const borderColor = isAI ? 'rgba(99,102,241,0.45)' : 'rgba(6,182,212,0.35)';
+    toast.style.cssText = [
+      'position:fixed', 'bottom:28px', 'left:50%', 'transform:translateX(-50%)',
+      'background:#0b1929', `border:1px solid ${borderColor}`,
+      'border-radius:12px', 'padding:14px 18px', 'z-index:99999',
+      'box-shadow:0 12px 40px rgba(0,0,0,0.7)', 'min-width:280px', 'max-width:460px',
+      'animation:cascadeToastIn 0.22s ease',
+    ].join(';');
+
+    const anchorComp = _findComponent(anchorId);
+    const anchorName = anchorComp?.name || anchorId;
+
+    const rows = updates.slice(0, 8).map(u => `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:5px">
+        <span style="color:#94a3b8;font-size:11px">${esc(u.compName)}</span>
+        <span style="display:flex;align-items:center;gap:5px;font-size:10px;font-family:monospace">
+          ${u.oldVersion ? `<span style="color:rgba(148,163,184,0.35);text-decoration:line-through">${esc(u.oldVersion)}</span>` : ''}
+          <span style="color:#67e8f9">${esc(u.newVersion)}</span>
+        </span>
+      </div>`).join('');
+    const more = updates.length > 8
+      ? `<div style="color:rgba(148,163,184,0.4);font-size:10px;margin-top:4px">+${updates.length - 8} more updated</div>` : '';
+
+    const icon = isAI ? '✦' : '⚡';
+    const label = isAI
+      ? `AI-researched for <span style="color:#a5b4fc;font-family:monospace">${esc(anchorName)} ${esc(anchorVersion)}</span>`
+      : `Auto-configured for <span style="color:#67e8f9;font-family:monospace">${esc(anchorName)} ${esc(anchorVersion)}</span>`;
+    const footer = isAI
+      ? 'Researched by AI (gpt-4o-mini) • click any badge to override'
+      : 'Compatible versions auto-selected • click any badge to change';
+    toast.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:13px">${icon}</span>
+        <span style="font-size:12px;font-weight:600;color:#e2e8f0">${label}</span>
+      </div>
+      <div style="border-top:1px solid rgba(255,255,255,0.07);padding-top:6px">${rows}${more}</div>
+      <div style="margin-top:8px;font-size:10px;color:rgba(148,163,184,0.4)">${footer}</div>`;
+
+    document.body.appendChild(toast);
+    setTimeout(() => {
+      toast.style.transition = 'opacity 0.4s';
+      toast.style.opacity = '0';
+      setTimeout(() => toast.remove(), 420);
+    }, 5000);
+  }
+
+  // ---- Dynamic version loading ----
+
+  async function loadCompatRules() {
+    try {
+      const r = await fetch('/api/compat-rules');
+      if (r.ok) { const d = await r.json(); state.compatRules = d.rules || []; }
+    } catch (e) { console.warn('compat-rules fetch failed', e); }
+  }
+
+  async function loadVersionsForComponent(compId) {
+    if (state.versionsLoading.has(compId)) return;
+    state.versionsLoading.add(compId);
+    try {
+      const r = await fetch(`/api/versions/${encodeURIComponent(compId)}`);
+      if (r.ok) {
+        const d = await r.json();
+        state.dynamicVersions[compId] = d.versions || [];
+      }
+    } catch (e) { console.warn(`versions/${compId} fetch failed`, e); }
+    finally {
+      state.versionsLoading.delete(compId);
+      renderCatalog();
+    }
+  }
+
+  async function loadAllCatalogVersions() {
+    await loadCompatRules();
+    const ids = [];
+    (state.catalog?.categories || []).forEach(cat =>
+      (cat.components || []).filter(c => !c.hidden).forEach(c => ids.push(c.id))
+    );
+    // Fetch in batches of 5 to avoid stampeding the server
+    for (let i = 0; i < ids.length; i += 5) {
+      await Promise.all(ids.slice(i, i + 5).map(loadVersionsForComponent));
+    }
   }
 
   function renderCatalog() {
@@ -2317,18 +2912,72 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
 
         let versionDropdown = '';
         let versionPill = '';
-        if (hasVersionOptions) {
-          const selectedVer = _getSelectedVersion(comp.id);
-          const allowed = _getAllowedVersions(comp.id);
-          const opts = comp.version_options.map(opt => {
-            const isAllowed = !allowed || allowed.has(opt.version);
-            const isSel = opt.version === selectedVer;
-            return `<option value="${esc(opt.version)}" ${isSel ? 'selected' : ''} ${!isAllowed ? 'disabled' : ''}>${esc(opt.label || 'v'+opt.version)}${!isAllowed ? ' — incompatible' : ''}</option>`;
-          }).join('');
-          versionDropdown = `<select class="version-select text-[10px] mono rounded px-1.5 py-0.5 cursor-pointer outline-none" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);color:#94a3b8;margin-top:3px" data-comp="${esc(comp.id)}">${opts}</select>`;
-        } else {
-          const ver = comp.version || '?';
-          versionPill = `<span class="text-[10px] mono shrink-0" style="color:rgba(148,163,184,0.45)">v${esc(String(ver))}</span>`;
+        {
+          // Merge dynamic + catalog version options for the picker
+          const dynVers = state.dynamicVersions[comp.id] || [];
+          const isLoading = state.versionsLoading.has(comp.id);
+          const seenVers = new Set(dynVers.map(v => v.version));
+          const allVersions = [...dynVers];
+          for (const opt of (comp.version_options || [])) {
+            const vs = String(opt.version);
+            if (!seenVers.has(vs)) {
+              allVersions.push({ version: vs, label: opt.label || vs, source: 'catalog',
+                badges: opt.badges, tagline: opt.tagline, cart_id: opt.cart_id });
+              seenVers.add(vs);
+            }
+          }
+
+          if (allVersions.length > 1 || isLoading) {
+            const selectedVer = _getSelectedVersion(comp.id);
+            const allowed = _getAllowedVersions(comp.id);
+            const compatCount = allowed ? allVersions.filter(v => [...allowed].some(av => av === v.version || _baseVersion(av) === _baseVersion(v.version))).length : allVersions.length;
+            const rows = allVersions.map(v => {
+              const baseV = _baseVersion(v.version);
+              const isAllowed = !allowed || [...allowed].some(av => av === v.version || _baseVersion(av) === baseV);
+              const isSel = v.version === selectedVer;
+              const dateStr = v.release_date ? v.release_date.slice(0, 7) : '';
+              const srcIcon = v.source === 'apache' ? '⬆' : v.source === 'github' ? '⎇' : v.source === 'dockerhub' ? '⬡' : '';
+              return `<div class="ver-opt" data-version="${esc(v.version)}" data-comp="${esc(comp.id)}"
+                style="display:flex;align-items:center;justify-content:space-between;padding:4px 10px;cursor:${isAllowed?'pointer':'default'};
+                  background:${isSel?'rgba(6,182,212,0.12)':'transparent'};
+                  border-left:2px solid ${isSel?'#06b6d4':'transparent'}">
+                <span style="font-family:monospace;font-size:11px;color:${isAllowed?(isSel?'#67e8f9':'#cbd5e1'):'rgba(148,163,184,0.35)'}">${esc(v.label||v.version)}</span>
+                <span style="font-size:9px;color:rgba(148,163,184,0.4);margin-left:6px;white-space:nowrap">${dateStr}${!isAllowed?' <span style="color:#ef4444">✗</span>':''} ${srcIcon}</span>
+              </div>`;
+            }).join('');
+            const countLabel = isLoading ? 'loading…' : `${allVersions.length} version${allVersions.length!==1?'s':''}${allowed&&compatCount<allVersions.length?' · '+compatCount+' compatible':''}`;
+            versionDropdown = `<div class="ver-wrap" style="position:relative;margin-top:4px" data-comp="${esc(comp.id)}">
+              <button class="ver-trigger" data-comp="${esc(comp.id)}"
+                style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 6px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:5px;color:#94a3b8;font-size:10px;font-family:monospace;cursor:pointer;user-select:none">
+                <span style="color:#67e8f9">v${esc(selectedVer||'?')}</span>
+                <span style="color:rgba(148,163,184,0.4);font-size:9px">${isLoading?'↻':'▾'}</span>
+                <span style="color:rgba(148,163,184,0.3);font-size:9px">${allVersions.length}</span>
+              </button>
+              <div class="ver-panel" data-comp="${esc(comp.id)}" style="display:none;position:absolute;z-index:9999;left:0;top:calc(100% + 4px);min-width:210px;max-width:260px;background:#0d1526;border:1px solid rgba(255,255,255,0.15);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.7);overflow:hidden">
+                <div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.08)">
+                  <input class="ver-search" data-comp="${esc(comp.id)}" placeholder="🔍 search version…"
+                    style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e2e8f0;font-size:11px;padding:4px 8px;outline:none;font-family:monospace">
+                </div>
+                <div class="ver-list" style="overflow-y:auto;max-height:200px">${rows}</div>
+                <div style="padding:4px 10px 5px;border-top:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:space-between;gap:4px">
+                  <span style="font-size:9px;color:rgba(148,163,184,0.35)">${countLabel}</span>
+                  <div style="display:flex;gap:4px;align-items:center">
+                    ${['spark-hudi','spark-delta'].includes(comp.id) ? `<button class="ver-build-btn" data-comp="${esc(comp.id)}" title="LLM-research version → docker build + push"
+                      style="font-size:9px;padding:2px 7px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);border-radius:4px;color:#6ee7b7;cursor:pointer;font-family:monospace;white-space:nowrap">
+                      ⚙ Build Image
+                    </button>` : ''}
+                    <button class="ver-ai-btn" data-comp="${esc(comp.id)}" title="AI-research best compatible versions for all components"
+                      style="font-size:9px;padding:2px 7px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.35);border-radius:4px;color:#a5b4fc;cursor:pointer;font-family:monospace;white-space:nowrap">
+                      ✦ AI Auto-select
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>`;
+          } else {
+            const ver = (allVersions[0]?.version) || comp.version || '?';
+            versionPill = `<span class="text-[10px] mono shrink-0" style="color:rgba(148,163,184,0.45)">v${esc(String(ver))}</span>`;
+          }
         }
 
         return `
@@ -2400,12 +3049,959 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
         showComponentDetails(b.dataset.comp);
       });
     });
-    // Wire version dropdowns — cascade on change
-    wrap.querySelectorAll(".version-select").forEach(sel => {
-      sel.addEventListener("change", () => {
-        applyVersionCascade(sel.dataset.comp, sel.value);
+    // Wire version dropdown trigger buttons
+    wrap.querySelectorAll(".ver-trigger").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const compId = btn.dataset.comp;
+        const panel = wrap.querySelector(`.ver-panel[data-comp="${compId}"]`);
+        // Close any other open panels
+        wrap.querySelectorAll(".ver-panel").forEach(p => {
+          if (p !== panel) p.style.display = 'none';
+        });
+        if (!panel) return;
+        const isOpen = panel.style.display !== 'none';
+        panel.style.display = isOpen ? 'none' : 'block';
+        if (!isOpen) {
+          const si = panel.querySelector(".ver-search");
+          if (si) { si.value = ''; si.focus(); }
+          // Show all items
+          panel.querySelectorAll(".ver-opt").forEach(o => o.style.display = '');
+        }
       });
     });
+
+    // Wire version search inputs inside panels
+    wrap.querySelectorAll(".ver-search").forEach(si => {
+      si.addEventListener("input", () => {
+        const q = si.value.toLowerCase();
+        const panel = si.closest(".ver-panel");
+        if (!panel) return;
+        panel.querySelectorAll(".ver-opt").forEach(opt => {
+          const v = (opt.dataset.version || '').toLowerCase();
+          opt.style.display = v.includes(q) ? '' : 'none';
+        });
+      });
+      si.addEventListener("click", e => e.stopPropagation());
+    });
+
+    // Wire version option selections
+    wrap.querySelectorAll(".ver-opt").forEach(opt => {
+      opt.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const version = opt.dataset.version;
+        const compId = opt.dataset.comp;
+        if (!version || !compId) return;
+        // Close the panel
+        const panel = opt.closest(".ver-panel");
+        if (panel) panel.style.display = 'none';
+        applyVersionCascade(compId, version);
+      });
+      opt.addEventListener("mouseenter", () => {
+        opt.style.background = opt.style.background.includes('06b6d4') ? opt.style.background : 'rgba(255,255,255,0.05)';
+      });
+      opt.addEventListener("mouseleave", () => {
+        const isSel = opt.dataset.version === _getSelectedVersion(opt.dataset.comp);
+        opt.style.background = isSel ? 'rgba(6,182,212,0.12)' : 'transparent';
+      });
+    });
+
+    // Wire Build Image buttons
+    wrap.querySelectorAll(".ver-build-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        wrap.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
+        _openBuildModal(btn.dataset.comp);
+      });
+    });
+
+    // Wire AI Auto-select buttons
+    wrap.querySelectorAll(".ver-ai-btn").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const compId = btn.dataset.comp;
+        const anchorVersion = _getSelectedVersion(compId);
+        if (!anchorVersion) return;
+
+        // Close the open panel
+        wrap.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
+
+        // Visual feedback
+        btn.textContent = '✦ Researching…';
+        btn.style.opacity = '0.6';
+        btn.disabled = true;
+
+        _showAiResearchingToast(compId, anchorVersion);
+
+        try {
+          const res = await fetch('/api/compat-ai/research', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ anchor_id: compId, anchor_version: anchorVersion }),
+          });
+          const data = await res.json();
+          if (data.error) throw new Error(data.error);
+
+          const aiCompat = data.compat || {};
+          const autoUpdated = [];
+          Object.entries(aiCompat).forEach(([targetId, bestVer]) => {
+            const prev = state.selectedVersions[targetId];
+            if (prev === bestVer) return;
+            state.selectedVersions[targetId] = bestVer;
+            const comp = _findComponent(targetId);
+            autoUpdated.push({ id: targetId, oldVersion: prev, newVersion: bestVer, compName: comp?.name || targetId });
+          });
+
+          renderCatalog();
+          _showCascadeToast(compId, anchorVersion, autoUpdated, /* isAI */ true);
+        } catch (err) {
+          _showAiErrorToast(String(err));
+        }
+
+        btn.textContent = '✦ AI Auto-select';
+        btn.style.opacity = '';
+        btn.disabled = false;
+      });
+    });
+  }
+
+  function _showAiResearchingToast(compId, version) {
+    const prev = document.getElementById('cascade-toast');
+    if (prev) prev.remove();
+    const toast = document.createElement('div');
+    toast.id = 'cascade-toast';
+    toast.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#0b1929;border:1px solid rgba(99,102,241,0.4);border-radius:12px;padding:12px 20px;z-index:99999;box-shadow:0 12px 40px rgba(0,0,0,0.7);font-size:12px;color:#a5b4fc;animation:cascadeToastIn 0.22s ease;display:flex;align-items:center;gap:8px';
+    toast.innerHTML = `<span style="animation:pulse 1s infinite;display:inline-block">✦</span> AI researching best compatible versions for <span style="font-family:monospace;color:#67e8f9">${esc(compId)} ${esc(version)}</span>…`;
+    document.body.appendChild(toast);
+  }
+
+  function _showAiErrorToast(errMsg) {
+    const prev = document.getElementById('cascade-toast');
+    if (prev) prev.remove();
+    const toast = document.createElement('div');
+    toast.id = 'cascade-toast';
+    toast.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#1a0b0b;border:1px solid rgba(239,68,68,0.4);border-radius:12px;padding:12px 20px;z-index:99999;box-shadow:0 12px 40px rgba(0,0,0,0.7);font-size:12px;color:#fca5a5;animation:cascadeToastIn 0.22s ease';
+    toast.innerHTML = `✗ AI research failed: ${esc(errMsg)}`;
+    document.body.appendChild(toast);
+    setTimeout(() => { toast.style.transition='opacity 0.4s'; toast.style.opacity='0'; setTimeout(()=>toast.remove(),420); }, 4000);
+  }
+
+  // ---- Image Build Modal ----
+  const _IBM_ADDON_LABELS = { 'spark-hudi': 'Apache Hudi', 'spark-delta': 'Delta Lake' };
+
+  function _ibmPhase(name) {
+    ['research','confirm','build','error'].forEach(p => {
+      document.getElementById(`ibm-phase-${p}`).classList.toggle('hidden', p !== name);
+    });
+  }
+
+  function _appendLog(line) {
+    const log = document.getElementById('ibm-log');
+    const el = document.createElement('div');
+    el.textContent = line;
+    if (line.startsWith('[error]')) el.style.color = '#fca5a5';
+    else if (line.startsWith('[done]') || line.includes('✓')) el.style.color = '#6ee7b7';
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function _openBuildModal(compId) {
+    const modal = document.getElementById('img-build-modal');
+    const comp = _findComponent(compId);
+    document.getElementById('ibm-title').textContent = `Build ${comp?.name || compId}`;
+    document.getElementById('ibm-subtitle').textContent = `lakehousestudio/${compId}`;
+    document.getElementById('ibm-rec-addon-label').textContent = _IBM_ADDON_LABELS[compId] || 'Addon';
+    document.getElementById('ibm-log').innerHTML = '';
+    _ibmPhase('research');
+    modal.classList.remove('hidden');
+
+    let research = null;
+    try {
+      const res = await fetch('/api/image-build/research', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id: compId }),
+      });
+      research = await res.json();
+      if (research.error) throw new Error(research.error);
+    } catch (err) {
+      _ibmPhase('error');
+      document.getElementById('ibm-error-msg').textContent = `Research failed: ${err}`;
+      return;
+    }
+
+    document.getElementById('ibm-rec-image').textContent = research.full_image;
+    document.getElementById('ibm-rec-spark').textContent = `Spark ${research.spark_ver}`;
+    document.getElementById('ibm-rec-addon').textContent = `${_IBM_ADDON_LABELS[compId] || 'Addon'} ${research.addon_ver}`;
+    document.getElementById('ibm-rec-reason').textContent = research.reason || '';
+    _ibmPhase('confirm');
+
+    document.getElementById('ibm-build-btn').onclick = async () => {
+      _ibmPhase('build');
+      document.getElementById('ibm-build-status').textContent = 'starting…';
+
+      let jobId = null;
+      try {
+        const r = await fetch('/api/image-build/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image_id: compId, research }),
+        });
+        const d = await r.json();
+        if (d.job_id) jobId = d.job_id;
+        else throw new Error(d.detail || 'no job_id');
+      } catch (err) {
+        _ibmPhase('error');
+        document.getElementById('ibm-error-msg').textContent = `Failed to start build: ${err}`;
+        return;
+      }
+
+      const es = new EventSource(`/api/image-build/stream/${jobId}`);
+      es.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.line) {
+          _appendLog(d.line);
+          document.getElementById('ibm-build-status').textContent = d.status + '…';
+        }
+        if (d.done) {
+          es.close();
+          document.getElementById('ibm-build-status').textContent =
+            d.status === 'done' ? `✓ ${research.full_image} pushed` : '✗ build failed';
+          document.getElementById('ibm-build-footer').classList.remove('hidden');
+          if (d.status === 'done') {
+            // Refresh the version picker so the new tag appears
+            state.versionCache = state.versionCache || {};
+            delete state.versionCache[compId];
+            fetch(`/api/versions/${compId}/refresh`, { method: 'POST' }).then(() => renderCatalog());
+          }
+        }
+      };
+      es.onerror = () => {
+        es.close();
+        _appendLog('[error] SSE connection dropped');
+        document.getElementById('ibm-build-footer').classList.remove('hidden');
+      };
+    };
+  }
+
+  // Wire modal close buttons (run once at startup)
+  document.getElementById('ibm-close').addEventListener('click', () =>
+    document.getElementById('img-build-modal').classList.add('hidden'));
+  document.getElementById('ibm-cancel').addEventListener('click', () =>
+    document.getElementById('img-build-modal').classList.add('hidden'));
+  document.getElementById('ibm-done-btn').addEventListener('click', () =>
+    document.getElementById('img-build-modal').classList.add('hidden'));
+  document.getElementById('ibm-err-close').addEventListener('click', () =>
+    document.getElementById('img-build-modal').classList.add('hidden'));
+
+  // ============================================================
+  // AI Lakehouse Provisioner
+  // ============================================================
+
+  const _AIP_PHASES = [
+    { id: "research",   label: "Version Research" },
+    { id: "gen_config", label: "Config Generation" },
+    { id: "install",    label: "Stack Install" },
+    { id: "post_cfg",   label: "Post-Start Config" },
+    { id: "verify",     label: "Connectivity" },
+    { id: "summary",    label: "Ready" },
+  ];
+
+  let _aipEvtSource = null;
+
+  function _aipClose() {
+    document.getElementById('ai-prov-modal').classList.add('hidden');
+    if (_aipEvtSource) { _aipEvtSource.close(); _aipEvtSource = null; }
+  }
+
+  document.getElementById('aip-close').addEventListener('click', _aipClose);
+  document.getElementById('aip-err-close').addEventListener('click', _aipClose);
+  document.getElementById('aip-done-btn').addEventListener('click', _aipClose);
+
+  function _aipRenderPhases(phaseStates) {
+    const el = document.getElementById('aip-phases');
+    el.innerHTML = _AIP_PHASES.map(p => {
+      const st = phaseStates[p.id] || 'pending';
+      const colors = {
+        pending: 'rgba(255,255,255,0.04)',
+        active:  'rgba(168,85,247,0.15)',
+        done:    'rgba(16,185,129,0.12)',
+        failed:  'rgba(244,63,94,0.12)',
+      };
+      const borders = {
+        pending: 'rgba(255,255,255,0.08)',
+        active:  'rgba(168,85,247,0.4)',
+        done:    'rgba(16,185,129,0.35)',
+        failed:  'rgba(244,63,94,0.35)',
+      };
+      const icons = { pending: '○', active: '◎', done: '✓', failed: '✗' };
+      const textCols = { pending: '#64748b', active: '#c4b5fd', done: '#6ee7b7', failed: '#fca5a5' };
+      return `<div class="rounded-lg p-2.5 text-center text-xs" style="background:${colors[st]};border:1px solid ${borders[st]}">
+        <div style="color:${textCols[st]};font-size:0.85em">${icons[st]}</div>
+        <div class="mt-0.5 font-medium" style="color:${textCols[st]}">${esc(p.label)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function _aipLog(line) {
+    const inner = document.getElementById('aip-log-inner');
+    const div = document.createElement('div');
+    div.textContent = line;
+    inner.appendChild(div);
+    const logEl = document.getElementById('aip-log');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  async function _openAiProvModal() {
+    const stackId  = state.selected?.id;
+    const cartSels = {};
+    // Collect cart selections from state
+    if (state.cart) {
+      state.cart.forEach(item => {
+        if (item.id) cartSels[item.id] = item.version || item.selectedVersion || '';
+      });
+    }
+    if (!stackId) { showToast('No stack selected', 'error'); return; }
+
+    const modal = document.getElementById('ai-prov-modal');
+    document.getElementById('aip-subtitle').textContent = stackId;
+    document.getElementById('aip-log-inner').innerHTML = '';
+    document.getElementById('aip-summary').classList.add('hidden');
+    document.getElementById('aip-error').classList.add('hidden');
+    modal.classList.remove('hidden');
+
+    const initStates = {};
+    _AIP_PHASES.forEach(p => initStates[p.id] = 'pending');
+    _aipRenderPhases(initStates);
+
+    // Kick off provisioning
+    let jobId;
+    try {
+      const r = await api('/api/ai-provision/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          stack_id:        stackId,
+          cart_selections: cartSels,
+          install_options: { host: state.host || 'localhost' },
+        }),
+      });
+      jobId = r.job_id;
+    } catch (e) {
+      document.getElementById('aip-error').classList.remove('hidden');
+      document.getElementById('aip-error-msg').textContent = `Failed to start: ${e.message || e}`;
+      return;
+    }
+
+    // Subscribe to SSE stream
+    if (_aipEvtSource) _aipEvtSource.close();
+    _aipEvtSource = new EventSource(`/api/ai-provision/stream/${jobId}`);
+
+    _aipEvtSource.onmessage = (evt) => {
+      let d;
+      try { d = JSON.parse(evt.data); } catch { return; }
+
+      if (d.kind === 'heartbeat') return;
+
+      if (d.kind === 'log' && d.line != null) {
+        _aipLog(d.line);
+      }
+
+      if (d.kind === 'phase_start' || d.kind === 'phase_end') {
+        // Refresh phase states from server
+        fetch(`/api/ai-provision/status/${jobId}`)
+          .then(r => r.json())
+          .then(s => _aipRenderPhases(s.phase_states || {}))
+          .catch(() => {});
+      }
+
+      if (d.kind === 'connection_info') {
+        // Build endpoint list
+        const info = d.info || {};
+        const endpEl = document.getElementById('aip-endpoints');
+        endpEl.innerHTML = Object.entries(info).map(([k, v]) =>
+          `<div><span class="text-slate-500">${esc(k.replace(/_/g,' '))}</span><br>
+           <a href="${esc(v.replace('HOST','localhost'))}" target="_blank"
+              class="mono text-indigo-300 hover:text-indigo-100">${esc(v)}</a></div>`
+        ).join('');
+
+        if (d.pipeline_example) {
+          document.getElementById('aip-pipeline-code').textContent = d.pipeline_example;
+          document.getElementById('aip-pipeline-wrap').classList.remove('hidden');
+        }
+      }
+
+      if (d.kind === 'provision_complete') {
+        _aipEvtSource.close(); _aipEvtSource = null;
+        if (d.error) {
+          document.getElementById('aip-error').classList.remove('hidden');
+          document.getElementById('aip-error-msg').textContent = d.error;
+        } else {
+          document.getElementById('aip-summary').classList.remove('hidden');
+          document.getElementById('aip-log').style.height = '120px';
+        }
+      }
+    };
+
+    _aipEvtSource.onerror = () => {
+      _aipEvtSource.close(); _aipEvtSource = null;
+    };
+  }
+
+  // Wire the AI Build button on the inspect screen
+  document.getElementById('btn-ai-build').addEventListener('click', _openAiProvModal);
+
+  // ============================================================
+  // STACK BUILDER
+  // ============================================================
+
+  const _SB_PHASES = [
+    { id: "versions",   label: "AI Versions" },
+    { id: "resolve",    label: "Resolve deps" },
+    { id: "compose",    label: "Compose YAML" },
+    { id: "ai_config",  label: "AI Config" },
+    { id: "write_files",label: "Write files" },
+    { id: "start",      label: "Start stack" },
+    { id: "post_cfg",   label: "Post-Start Init" },
+    { id: "verify",     label: "Verify" },
+    { id: "summary",    label: "Ready" },
+  ];
+
+  // ── state ──────────────────────────────────────────────────────────────
+  let _sbCatalog = [];          // [{id, name, category, description, image, version}]
+  let _sbCategoryGroups = {};   // {Category: [id, ...]}
+  let _sbMutuallyExclusive = [];// [[id,id], ...]
+  let _sbSelected = new Set();  // user-selected component IDs
+  let _sbResolved = [];         // resolved + auto-added
+  let _sbAutoAdded = [];        // auto-added only
+  let _sbVersions = {};         // {id: version}
+  let _sbEvtSource = null;
+
+  // ── open/close ──────────────────────────────────────────────────────────
+  async function _sbOpen() {
+    document.getElementById('sb-modal').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    if (_sbCatalog.length === 0) await _sbLoadCatalog();
+  }
+
+  function _sbClose() {
+    document.getElementById('sb-modal').classList.add('hidden');
+    document.body.style.overflow = '';
+  }
+
+  document.getElementById('sb-close').addEventListener('click', _sbClose);
+  document.getElementById('btn-stack-builder').addEventListener('click', _sbOpen);
+
+  // ── catalog load ──────────────────────────────────────────────────────
+  async function _sbLoadCatalog() {
+    try {
+      const r = await fetch('/api/stack-builder/catalog');
+      const d = await r.json();
+      _sbCatalog = d.components || [];
+      _sbCategoryGroups = d.category_groups || {};
+      _sbMutuallyExclusive = d.mutually_exclusive || [];
+      _sbRenderCatalog();
+    } catch (e) {
+      console.error('Stack Builder catalog load failed', e);
+    }
+  }
+
+  // ── render catalog left panel ─────────────────────────────────────────
+  function _sbRenderCatalog(filter = '') {
+    const container = document.getElementById('sb-catalog');
+    const lc = filter.toLowerCase();
+    let html = '';
+    for (const [group, ids] of Object.entries(_sbCategoryGroups)) {
+      const items = ids
+        .map(id => _sbCatalog.find(c => c.id === id))
+        .filter(c => c && (!lc || c.name.toLowerCase().includes(lc) || c.description.toLowerCase().includes(lc)));
+      if (!items.length) continue;
+      html += `<div>
+        <div class="text-xs uppercase tracking-widest mb-2 px-1" style="color:#6b7280;letter-spacing:.1em">${esc(group)}</div>
+        <div class="space-y-1">`;
+      for (const c of items) {
+        const sel = _sbSelected.has(c.id);
+        const autoAdded = _sbAutoAdded.includes(c.id) && !_sbSelected.has(c.id);
+        const expBadge = c.experimental
+        ? `<span style="font-size:0.55rem;padding:1px 4px;border-radius:3px;background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3);margin-left:4px">EXP</span>`
+        : '';
+      html += `<button class="w-full text-left px-3 py-2.5 rounded-lg text-sm transition-all sb-comp-btn ${sel ? 'sb-sel' : ''}"
+          data-id="${esc(c.id)}"
+          style="background:${sel ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.03)'};
+                 border:1px solid ${sel ? 'rgba(168,85,247,0.35)' : 'rgba(255,255,255,0.06)'};
+                 color:${sel ? '#e9d5ff' : '#94a3b8'}">
+          <div class="flex items-center justify-between">
+            <span class="font-medium ${sel ? 'text-violet-300' : 'text-slate-300'}">${esc(c.name)}${expBadge}</span>
+            ${sel ? '<span style="color:#a855f7;font-size:0.75rem">✓</span>' : '<span style="color:#374151;font-size:0.6rem">+</span>'}
+          </div>
+          <div class="text-xs mt-0.5 truncate" style="color:#4b5563">${esc(c.description.slice(0, 60))}…</div>
+        </button>`;
+      }
+      html += `</div></div>`;
+    }
+    container.innerHTML = html || '<div class="text-xs text-slate-600 px-2 py-4">No components match.</div>';
+
+    container.querySelectorAll('.sb-comp-btn').forEach(btn => {
+      btn.addEventListener('click', () => _sbToggle(btn.dataset.id));
+    });
+  }
+
+  // ── toggle component selection ────────────────────────────────────────
+  function _sbToggle(id) {
+    // Check mutual exclusion
+    const excludes = _sbMutuallyExclusive
+      .filter(pair => pair.includes(id))
+      .map(pair => pair.find(x => x !== id));
+    for (const ex of excludes) {
+      if (_sbSelected.has(ex)) {
+        _sbSelected.delete(ex);
+      }
+    }
+
+    if (_sbSelected.has(id)) {
+      _sbSelected.delete(id);
+    } else {
+      _sbSelected.add(id);
+    }
+    _sbResolve();
+  }
+
+  // ── resolve deps (debounced) ──────────────────────────────────────────
+  let _sbResolveTimer = null;
+  function _sbResolve() {
+    clearTimeout(_sbResolveTimer);
+    _sbResolveTimer = setTimeout(_sbDoResolve, 80);
+  }
+
+  async function _sbDoResolve() {
+    if (_sbSelected.size === 0) {
+      _sbResolved = [];
+      _sbAutoAdded = [];
+      _sbUpdateUI();
+      return;
+    }
+    try {
+      const r = await fetch('/api/stack-builder/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selected: [..._sbSelected] }),
+      });
+      const d = await r.json();
+      _sbResolved = d.resolved || [];
+      _sbAutoAdded = d.auto_added || [];
+    } catch (_) {
+      _sbResolved = [..._sbSelected];
+      _sbAutoAdded = [];
+    }
+    _sbUpdateUI();
+  }
+
+  // ── update all UI panels ──────────────────────────────────────────────
+  function _sbUpdateUI() {
+    _sbRenderCatalog(document.getElementById('sb-search').value);
+    _sbRenderSelected();
+    _sbRenderAuto();
+    _sbRenderVersions();
+    _sbCheckConflicts();
+
+    const hasSelection = _sbSelected.size > 0;
+    document.getElementById('sb-build-btn').disabled = !hasSelection;
+    const previewBtn = document.getElementById('sb-preview-btn');
+    if (hasSelection) previewBtn.classList.remove('hidden');
+    else previewBtn.classList.add('hidden');
+  }
+
+  function _sbRenderSelected() {
+    const list = document.getElementById('sb-selected-list');
+    const count = document.getElementById('sb-count');
+    count.textContent = `${_sbSelected.size} selected`;
+
+    if (_sbSelected.size === 0) {
+      list.innerHTML = '<div class="text-sm text-slate-500 italic py-4 text-center">Pick components from the left panel</div>';
+      return;
+    }
+    let html = '';
+    for (const id of [..._sbSelected]) {
+      const comp = _sbCatalog.find(c => c.id === id);
+      if (!comp) continue;
+      html += `<div class="flex items-center justify-between px-3 py-2 rounded-lg"
+                    style="background:rgba(168,85,247,0.08);border:1px solid rgba(168,85,247,0.2)">
+        <div>
+          <span class="text-sm font-medium text-violet-300">${esc(comp.name)}</span>
+          <span class="text-xs text-slate-500 ml-2 mono">${esc(_sbVersions[id] || comp.version)}</span>
+        </div>
+        <button onclick="_sbToggle('${id}')" class="text-slate-500 hover:text-rose-400 text-xs transition-colors">✕</button>
+      </div>`;
+    }
+    list.innerHTML = html;
+  }
+
+  function _sbRenderAuto() {
+    const section = document.getElementById('sb-auto-section');
+    const list = document.getElementById('sb-auto-list');
+    if (!_sbAutoAdded.length) { section.classList.add('hidden'); return; }
+    section.classList.remove('hidden');
+    list.innerHTML = _sbAutoAdded.map(id => {
+      const comp = _sbCatalog.find(c => c.id === id);
+      return `<span class="text-xs px-2 py-1 rounded-full" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#a5b4fc">${esc(comp ? comp.name : id)}</span>`;
+    }).join('');
+  }
+
+  function _sbRenderVersions() {
+    const panel = document.getElementById('sb-versions-panel');
+    if (_sbSelected.size === 0) {
+      panel.innerHTML = '<div class="text-xs text-slate-500 italic">Select components first to see version pickers</div>';
+      return;
+    }
+    let html = '';
+    for (const id of [..._sbSelected]) {
+      const comp = _sbCatalog.find(c => c.id === id);
+      if (!comp) continue;
+      const cur = _sbVersions[id] || comp.version;
+      html += `<div class="flex items-center gap-3">
+        <span class="text-xs text-slate-400 w-32 truncate">${esc(comp.name)}</span>
+        <input type="text" value="${esc(cur)}" data-comp-id="${esc(id)}"
+               class="sb-ver-input flex-1 text-xs px-2 py-1 rounded mono"
+               style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;outline:none">
+      </div>`;
+    }
+    panel.innerHTML = html;
+    panel.querySelectorAll('.sb-ver-input').forEach(inp => {
+      inp.addEventListener('change', () => {
+        _sbVersions[inp.dataset.compId] = inp.value.trim();
+      });
+    });
+  }
+
+  function _sbCheckConflicts() {
+    const conflictDiv = document.getElementById('sb-conflicts');
+    const msgs = [];
+    for (const [a, b] of _sbMutuallyExclusive) {
+      if (_sbSelected.has(a) && _sbSelected.has(b)) {
+        msgs.push(`⚠ ${a} and ${b} cannot be used together`);
+      }
+    }
+    // Warn about experimental components
+    const expSelected = [..._sbSelected].filter(id => {
+      const c = _sbCatalog.find(x => x.id === id);
+      return c && c.experimental;
+    });
+    if (expSelected.length) {
+      msgs.push(`ℹ ${expSelected.join(', ')} marked EXP — no verified Docker Hub image; will be skipped during build`);
+    }
+    if (msgs.length) {
+      conflictDiv.innerHTML = msgs.join('<br>');
+      conflictDiv.classList.remove('hidden');
+    } else {
+      conflictDiv.classList.add('hidden');
+    }
+  }
+
+  // ── search ────────────────────────────────────────────────────────────
+  document.getElementById('sb-search').addEventListener('input', e => {
+    _sbRenderCatalog(e.target.value);
+  });
+
+  // ── versions toggle ───────────────────────────────────────────────────
+  document.getElementById('sb-versions-toggle').addEventListener('click', () => {
+    const panel = document.getElementById('sb-versions-panel');
+    const arrow = document.getElementById('sb-versions-arrow');
+    const hidden = panel.classList.toggle('hidden');
+    arrow.textContent = hidden ? '▶' : '▼';
+  });
+
+  // ── compose preview ───────────────────────────────────────────────────
+  document.getElementById('sb-preview-btn').addEventListener('click', async () => {
+    const panel = document.getElementById('sb-compose-panel');
+    const wasHidden = panel.classList.contains('hidden');
+    if (!wasHidden) { panel.classList.add('hidden'); return; }
+
+    try {
+      const r = await fetch('/api/stack-builder/compose-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selected: [..._sbSelected], versions: _sbVersions }),
+      });
+      const d = await r.json();
+      document.getElementById('sb-compose-code').textContent = d.compose_yaml || '';
+      panel.classList.remove('hidden');
+    } catch (e) {
+      alert('Failed to generate preview: ' + e.message);
+    }
+  });
+
+  document.getElementById('sb-compose-copy').addEventListener('click', () => {
+    const code = document.getElementById('sb-compose-code').textContent;
+    navigator.clipboard.writeText(code).catch(() => {});
+    document.getElementById('sb-compose-copy').textContent = 'copied!';
+    setTimeout(() => { document.getElementById('sb-compose-copy').textContent = 'copy'; }, 1500);
+  });
+
+  // ── AI Build ──────────────────────────────────────────────────────────
+  document.getElementById('sb-build-btn').addEventListener('click', _sbStartBuild);
+  document.getElementById('sb-prog-done-btn').addEventListener('click', _sbProgClose);
+  document.getElementById('sb-prog-err-close').addEventListener('click', _sbProgClose);
+  document.getElementById('sb-prog-close').addEventListener('click', _sbProgClose);
+  document.getElementById('sb-prog-err-retry').addEventListener('click', _sbRetryBuild);
+
+  let _sbLastBuildParams = null;
+
+  function _sbProgClose() {
+    document.getElementById('sb-progress-modal').classList.add('hidden');
+    if (_sbEvtSource) { _sbEvtSource.close(); _sbEvtSource = null; }
+  }
+
+  function _sbRetryBuild() {
+    if (!_sbLastBuildParams) return;
+    // Reset UI state then re-run with stored params
+    document.getElementById('sb-prog-log-inner').innerHTML = '';
+    document.getElementById('sb-prog-summary').classList.add('hidden');
+    document.getElementById('sb-prog-error').classList.add('hidden');
+    document.getElementById('sb-prog-close').classList.add('hidden');
+    _sbProgRenderPhases({});
+    _sbRunBuild(_sbLastBuildParams);
+  }
+
+  function _sbProgLog(line) {
+    const inner = document.getElementById('sb-prog-log-inner');
+    const el = document.createElement('div');
+    el.textContent = line;
+    inner.appendChild(el);
+    document.getElementById('sb-prog-log').scrollTop = 1e9;
+  }
+
+  function _sbProgRenderPhases(phaseStates) {
+    const container = document.getElementById('sb-prog-phases');
+    container.innerHTML = _SB_PHASES.map(p => {
+      const st = phaseStates[p.id] || 'pending';
+      const colors = {
+        pending: 'background:rgba(255,255,255,0.04);color:#4b5563;border-color:rgba(255,255,255,0.07)',
+        active:  'background:rgba(168,85,247,0.15);color:#d8b4fe;border-color:rgba(168,85,247,0.4)',
+        done:    'background:rgba(34,197,94,0.1);color:#86efac;border-color:rgba(34,197,94,0.3)',
+        failed:  'background:rgba(244,63,94,0.1);color:#fca5a5;border-color:rgba(244,63,94,0.3)',
+      };
+      const icons = { pending: '○', active: '◉', done: '✓', failed: '✗' };
+      return `<div class="text-xs rounded px-2 py-2 text-center" style="border:1px solid;${colors[st]}">
+        <div style="font-size:0.65rem">${icons[st]}</div>
+        <div class="truncate mt-0.5">${esc(p.label)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Pre-install dialog: review components, add tools, choose target ──────
+  let _piState = null;   // {templateId, label, stackName, components:Set, mode, catalog:[]}
+
+  async function _sbInstallTemplate(templateId, label) {
+    let preset, catalog;
+    try {
+      const r = await api('/api/stack-builder/presets');
+      preset = (r.presets || []).find(p => p.template_id === templateId);
+      const c = await api('/api/stack-builder/catalog');
+      catalog = c.components || [];
+    } catch (e) {
+      showToast(`Couldn't load preset: ${e.message}`); return;
+    }
+    if (!preset || !preset.components || !preset.components.length) {
+      showToast(`Template '${templateId}' has no installable components`); return;
+    }
+    _piState = {
+      templateId,
+      label,
+      stackName: preset.stack_name || templateId.replace(/_/g, '-'),
+      components: new Set(preset.components),
+      mode: 'local',
+      catalog,
+    };
+    document.getElementById('pi-card-label').textContent = label;
+    _piRenderComponents();
+    _piPopulateAddSelect();
+    _piSetMode('local');
+    document.getElementById('preinstall-modal').classList.remove('hidden');
+  }
+
+  function _piRenderComponents() {
+    const wrap = document.getElementById('pi-components');
+    wrap.innerHTML = [..._piState.components].map(id =>
+      `<span class="badge badge-stable flex items-center gap-1" style="padding:3px 8px">
+         ${esc(id)}
+         <button class="pi-rm text-rose-300 hover:text-rose-100 ml-1" data-id="${esc(id)}" title="remove">×</button>
+       </span>`
+    ).join('');
+    wrap.querySelectorAll('.pi-rm').forEach(b =>
+      b.addEventListener('click', () => {
+        _piState.components.delete(b.dataset.id);
+        _piRenderComponents(); _piPopulateAddSelect();
+      }));
+  }
+
+  function _piPopulateAddSelect() {
+    const sel = document.getElementById('pi-add-select');
+    const avail = (_piState.catalog || [])
+      .filter(c => !_piState.components.has(c.id))
+      .sort((a, b) => (a.category || '').localeCompare(b.category || ''));
+    sel.innerHTML = `<option value="">+ Add a component…</option>` +
+      avail.map(c => `<option value="${esc(c.id)}">${esc(c.category || '')} — ${esc(c.name || c.id)}</option>`).join('');
+  }
+
+  function _piSetMode(mode) {
+    _piState.mode = mode;
+    const localBtn = document.getElementById('pi-target-local');
+    const remoteBtn = document.getElementById('pi-target-remote');
+    const fields = document.getElementById('pi-remote-fields');
+    if (mode === 'remote') {
+      fields.classList.remove('hidden');
+      remoteBtn.className = 'btn-primary text-xs flex-1';
+      localBtn.className = 'btn-ghost text-xs flex-1';
+    } else {
+      fields.classList.add('hidden');
+      localBtn.className = 'btn-primary text-xs flex-1';
+      remoteBtn.className = 'btn-ghost text-xs flex-1';
+    }
+  }
+
+  function _piClose() { document.getElementById('preinstall-modal').classList.add('hidden'); }
+
+  // wire dialog controls
+  document.getElementById('pi-close').addEventListener('click', _piClose);
+  document.getElementById('pi-cancel').addEventListener('click', _piClose);
+  document.getElementById('pi-target-local').addEventListener('click', () => _piSetMode('local'));
+  document.getElementById('pi-target-remote').addEventListener('click', () => _piSetMode('remote'));
+  document.getElementById('pi-add-select').addEventListener('change', (e) => {
+    const id = e.target.value;
+    if (id) { _piState.components.add(id); _piRenderComponents(); _piPopulateAddSelect(); }
+  });
+
+  document.getElementById('pi-go').addEventListener('click', () => {
+    if (!_piState || _piState.components.size === 0) { showToast('Select at least one tool'); return; }
+    const params = {
+      selected: [..._piState.components],
+      versions: {},
+      stack_name: _piState.stackName,
+    };
+    if (_piState.mode === 'remote') {
+      const host = document.getElementById('pi-host').value.trim();
+      const user = document.getElementById('pi-ssh-user').value.trim();
+      if (!host || !user) { showToast('Host and SSH user are required for remote install'); return; }
+      params.target = {
+        mode: 'remote',
+        host,
+        ssh_user: user,
+        ssh_port: parseInt(document.getElementById('pi-ssh-port').value || '22', 10),
+        ssh_key_path: document.getElementById('pi-ssh-key').value.trim() || null,
+        ssh_password: document.getElementById('pi-ssh-pass').value || null,
+        install_dir: document.getElementById('pi-install-dir').value.trim() || null,
+      };
+    } else {
+      params.target = { mode: 'local' };
+    }
+    _piClose();
+    // Open progress modal and run the build with the chosen target.
+    _sbLastBuildParams = params;
+    const modal = document.getElementById('sb-progress-modal');
+    modal.classList.remove('hidden');
+    const tgt = params.target.mode === 'remote' ? `remote ${params.target.host}` : 'localhost';
+    document.getElementById('sb-prog-subtitle').textContent =
+      `${_piState.label} → ${tgt} — ${params.selected.join(', ')}`;
+    document.getElementById('sb-prog-log-inner').innerHTML = '';
+    document.getElementById('sb-prog-summary').classList.add('hidden');
+    document.getElementById('sb-prog-error').classList.add('hidden');
+    document.getElementById('sb-prog-close').classList.add('hidden');
+    _sbProgRenderPhases({});
+    _sbRunBuild(params);
+  });
+
+  async function _sbStartBuild() {
+    if (_sbSelected.size === 0) return;
+
+    const stackName = document.getElementById('sb-stack-name').value.trim() || 'custom-lakehouse';
+    _sbLastBuildParams = {
+      selected:   [..._sbSelected],
+      versions:   { ..._sbVersions },
+      stack_name: stackName,
+    };
+
+    // Open progress modal
+    const modal = document.getElementById('sb-progress-modal');
+    modal.classList.remove('hidden');
+    document.getElementById('sb-prog-subtitle').textContent = '';
+    document.getElementById('sb-prog-log-inner').innerHTML = '';
+    document.getElementById('sb-prog-summary').classList.add('hidden');
+    document.getElementById('sb-prog-error').classList.add('hidden');
+    document.getElementById('sb-prog-close').classList.add('hidden');
+    _sbProgRenderPhases({});
+
+    _sbRunBuild(_sbLastBuildParams);
+  }
+
+  async function _sbRunBuild(params) {
+    const { stack_name: stackName } = params;
+    try {
+      const r = await fetch('/api/stack-builder/build', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const { job_id } = await r.json();
+
+      document.getElementById('sb-prog-subtitle').textContent = `job: ${job_id.slice(0, 8)}…  stack: ${stackName}`;
+
+      // Subscribe to SSE stream
+      if (_sbEvtSource) _sbEvtSource.close();
+      _sbEvtSource = new EventSource(`/api/stack-builder/stream/${job_id}`);
+
+      const phaseStates = {};
+      _sbEvtSource.onmessage = (e) => {
+        const ev = JSON.parse(e.data);
+        if (ev.kind === 'log') {
+          _sbProgLog(ev.line || '');
+        } else if (ev.kind === 'phase_start') {
+          phaseStates[ev.phase] = 'active';
+          _sbProgRenderPhases(phaseStates);
+        } else if (ev.kind === 'phase_end') {
+          phaseStates[ev.phase] = ev.ok ? 'done' : 'failed';
+          _sbProgRenderPhases(phaseStates);
+        } else if (ev.kind === 'connection_info') {
+          const endpoints = document.getElementById('sb-prog-endpoints');
+          const info = ev.info || {};
+          endpoints.innerHTML = Object.entries(info).map(([k, v]) =>
+            `<div><span class="text-slate-400">${esc(k)}</span></div>
+             <div><a href="${esc(v)}" target="_blank" class="text-cyan-400 hover:underline mono">${esc(v)}</a></div>`
+          ).join('');
+          if (ev.pipeline_example) {
+            document.getElementById('sb-prog-pipeline-code').textContent = ev.pipeline_example;
+            document.getElementById('sb-prog-pipeline-wrap').classList.remove('hidden');
+          }
+        } else if (ev.kind === 'versions_ready') {
+          const vmap = ev.versions || {};
+          const lines = Object.entries(vmap).map(([k,v]) => `  ${k}: ${v}`).join('\n');
+          _sbProgLog(`AI-selected versions:\n${lines}`);
+        } else if (ev.kind === 'skipped_experimental') {
+          const names = (ev.components || []).join(', ');
+          _sbProgLog(`⚠ Skipped experimental: ${names} (no verified Docker Hub image)`);
+        } else if (ev.kind === 'provision_complete') {
+          document.getElementById('sb-prog-summary').classList.remove('hidden');
+          document.getElementById('sb-prog-close').classList.remove('hidden');
+          _sbEvtSource.close(); _sbEvtSource = null;
+        } else if (ev.kind === 'error') {
+          document.getElementById('sb-prog-error-msg').textContent = ev.message || 'Unknown error';
+          document.getElementById('sb-prog-error').classList.remove('hidden');
+          document.getElementById('sb-prog-close').classList.remove('hidden');
+          _sbEvtSource.close(); _sbEvtSource = null;
+        } else if (ev.kind === 'done') {
+          if (ev.state !== 'done') {
+            document.getElementById('sb-prog-close').classList.remove('hidden');
+          }
+        }
+      };
+      _sbEvtSource.onerror = () => {
+        _sbProgLog('[error] SSE stream disconnected');
+        document.getElementById('sb-prog-close').classList.remove('hidden');
+      };
+    } catch (err) {
+      document.getElementById('sb-prog-error-msg').textContent = String(err);
+      document.getElementById('sb-prog-error').classList.remove('hidden');
+      document.getElementById('sb-prog-close').classList.remove('hidden');
+    }
   }
 
   // ---- Details modal ----
@@ -2554,7 +4150,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
         const c = idx[id] || { name: id, category: "?" };
         const div = document.createElement("div");
         div.className = "flex items-center justify-between text-xs";
-        div.innerHTML = `<span class="text-emerald-300">✓</span><span class="flex-1 ml-2 text-slate-300">${esc(c.name)}</span><span class="text-slate-500">${esc(c.category)}</span>`;
+        const ver = _getSelectedVersion(id);
+        const verBadge = ver ? `<span style="font-family:monospace;font-size:9px;color:rgba(103,232,249,0.7);background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.18);border-radius:3px;padding:0 4px;margin-right:4px">v${esc(ver)}</span>` : '';
+        div.innerHTML = `<span class="text-emerald-300">✓</span><span class="flex-1 ml-2 text-slate-300">${esc(c.name)}</span>${verBadge}<span class="text-slate-500">${esc(c.category)}</span>`;
         list.appendChild(div);
       });
     }

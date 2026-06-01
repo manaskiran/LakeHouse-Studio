@@ -1190,12 +1190,22 @@ class UDPRunner:
             if sid == step_id: return i
         return -1
 
-    async def run(self, env_overrides: dict[str, str], *, start_at: str = "prepare") -> None:
+    async def run(
+        self,
+        env_overrides: dict[str, str],
+        *,
+        start_at: str = "prepare",
+        post_env_hook=None,
+    ) -> None:
         """Run the pipeline starting at `start_at` (default = beginning).
 
         On the first run this drives all steps. On a Retry, the caller passes
         the failed step id as start_at; on Skip, the caller passes the NEXT
         step id; rollback runs ./udp clean instead.
+
+        post_env_hook: optional async coroutine called after the `env` step
+        succeeds but before `doctor`/`start`. Signature: hook(install_dir).
+        Used by the AI provisioner to inject AI-generated configs.
         """
         try:
             self._set_state("INSPECTING")  # caller did the inspection already
@@ -1212,6 +1222,11 @@ class UDPRunner:
                 if state != "READY":
                     self._set_state(state)
                 ok = await self._execute_step(step_id, env_overrides)
+                if ok and step_id == "env" and post_env_hook is not None:
+                    try:
+                        await post_env_hook(self.install_dir)
+                    except Exception as _hook_exc:
+                        self._log("env", "stderr", f"post-env hook warning: {_hook_exc}")
                 if not ok:
                     # finalize failing means evidence didn't write, stack is still up
                     if step_id == "finalize":
