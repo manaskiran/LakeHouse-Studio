@@ -11,6 +11,16 @@ USER root
 RUN mkdir -p /etc/ranger/hive/policycache && \
     chown -R hive:hive /etc/ranger/hive/policycache
 
+# Install curl (not present in apache/hive:4.0.1 base image)
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL JDBC driver — not bundled in the official Hive image (defaults to Derby).
+# Required for metastore backed by PostgreSQL via PgBouncer.
+RUN curl -fsSL "https://jdbc.postgresql.org/download/postgresql-42.7.3.jar" \
+        -o /opt/hive/lib/postgresql.jar
+
 COPY entrypoint.sh /hive-ranger-entrypoint.sh
 RUN chmod +x /hive-ranger-entrypoint.sh
 

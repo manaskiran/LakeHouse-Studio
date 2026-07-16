@@ -687,7 +687,7 @@
 <!-- ============== AI PROVISION MODAL ============== -->
 <div id="ai-prov-modal" class="hidden fixed inset-0 z-[120] flex items-center justify-center p-4"
      style="background:rgba(7,6,26,0.88);backdrop-filter:blur(10px)">
-  <div class="glass w-full max-w-2xl p-6" style="border-color:rgba(168,85,247,0.3)">
+  <div class="glass w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto" style="border-color:rgba(168,85,247,0.3)">
 
     <!-- Header -->
     <div class="flex items-center justify-between mb-5">
@@ -815,16 +815,6 @@
             <div id="sb-auto-list" class="flex flex-wrap gap-1.5"></div>
           </div>
 
-          <!-- Version overrides (expandable) -->
-          <div class="mb-5">
-            <button id="sb-versions-toggle" class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1 hover:text-slate-200 transition-colors">
-              <span id="sb-versions-arrow">▶</span> Version overrides
-            </button>
-            <div id="sb-versions-panel" class="hidden mt-3 space-y-2">
-              <div class="text-xs text-slate-500 italic">Select components first to see version pickers</div>
-            </div>
-          </div>
-
           <!-- Conflict warnings -->
           <div id="sb-conflicts" class="hidden mb-4 text-sm text-amber-300 rounded-lg p-3"
                style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.25)">
@@ -926,7 +916,7 @@
 <!-- Stack Builder — Build Progress Modal -->
 <div id="sb-progress-modal" class="hidden fixed inset-0 z-[140] flex items-center justify-center p-4"
      style="background:rgba(7,6,26,0.88);backdrop-filter:blur(10px)">
-  <div class="glass w-full max-w-2xl p-6" style="border-color:rgba(168,85,247,0.3)">
+  <div class="glass w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto" style="border-color:rgba(168,85,247,0.3)">
 
     <div class="flex items-center justify-between mb-5">
       <div>
@@ -1442,6 +1432,7 @@
           <div id="step-list" class="space-y-1"></div>
         </div>
         <div id="failure-controls" class="hidden glass p-3 mt-3 space-y-2"></div>
+        <div id="running-controls" class="hidden glass p-3 mt-3 space-y-2"></div>
       </div>
       <div class="lg:col-span-2">
         <div class="terminal h-[480px] flex flex-col">
@@ -2057,10 +2048,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     sshPort: 22,
     sshKeyPath: "",
     sshPassword: "",
-    selectedVersions: {},
-    dynamicVersions: {},       // compId → [{version, label, release_date, source}, ...]
-    versionsLoading: new Set(), // compIds currently being fetched
-    compatRules: [],            // loaded once from /api/compat-rules
   };
 
   // Phase mapping for the top stepper
@@ -2155,10 +2142,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
   window.addEventListener("scroll", _invalidateSpotRects, { passive: true });
   window.addEventListener("resize", _invalidateSpotRects, { passive: true });
 
-  // Close any open version panel when clicking outside
-  document.addEventListener("click", () => {
-    document.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
-  });
   // Coarse invalidation when the screen changes (different DOM)
   const _origNavigate = window.navigate;  // will rebind below; placeholder
   function _refreshSpotRects() {
@@ -2407,7 +2390,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     const list = document.getElementById(listId); list.innerHTML = "";
     templates.forEach(t => {
       const div = document.createElement("div");
-      const installable = t.readiness !== "preview";
+      const installable = t.readiness !== "preview" && t.installable !== false;
       div.className = "glass glass-hover spot p-6 " + (installable ? "cursor-pointer" : "opacity-80");
       const tags = (t.compliance_tags || []).map(c =>
         `<span class="badge badge-exp">${esc(c.toUpperCase())}</span>`
@@ -2435,7 +2418,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
             ? (mode === "install"
                 ? `<button class="btn-primary text-xs sb-install-btn" data-tid="${esc(t.id)}">⚡ Install</button>`
                 : `<button class="btn-ghost text-xs sb-review-btn" data-tid="${esc(t.id)}">Review →</button>`)
-            : `<span class="text-xs text-slate-500">Preview only — coming v0.5</span>`}
+            : (t.readiness === "preview"
+                ? `<span class="text-xs text-slate-500">Preview only — coming v0.5</span>`
+                : `<span class="text-xs text-amber-400/70">Stack coming soon</span>`)}
         </div>
       `;
       if (installable) {
@@ -2466,7 +2451,11 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       showToast(`Couldn't load template: ${e.message}`); return;
     }
     // Cart pre-fill from the certified subset only — pending stays display-only.
-    state.cart = [...(detail.cart || [])];
+    // The TABLE FORMAT is deliberately left unselected so the user actively
+    // chooses Iceberg / Delta / Hudi (all three are supported by the same base
+    // stack + verified by the smoke). No format is defaulted.
+    const _TABLE_FORMAT_IDS = ["iceberg", "hudi", "hudi-v1", "delta"];
+    state.cart = [...(detail.cart || [])].filter(id => !_TABLE_FORMAT_IDS.includes(id));
     state.template = detail.id;
     state.templateStackId = detail.stack_id || null;
     state.templatePending = detail.pending || [];
@@ -2552,8 +2541,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     renderCatalog();
     renderTemplateBanner();
     await refreshCartValidation();
-    // Load dynamic versions in the background (non-blocking)
-    loadAllCatalogVersions().catch(e => console.warn("loadAllCatalogVersions failed", e));
   }
 
   function renderTemplateBanner() {
@@ -2612,15 +2599,28 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'monogram',textContent:'${esc((comp.name||'?')[0])}'}))">`;
   }
 
-  // ---- version cascade helpers ----
+  // ---- version helpers (catalog-default only — no live fetch, no picker) ----
 
-  // Returns the cart ID for a comp given the currently selected version.
-  // Some version options map to a different component ID (e.g. hudi v1.0.1 → hudi-v1).
+  // The version a component installs with is always its catalog default —
+  // either the version_option flagged default:true, the first option, or
+  // the bare `version` field. There is no per-install override from the UI.
+  function _getSelectedVersion(compId) {
+    const comp = _findComponent(compId);
+    if (!comp) return null;
+    if (comp.version_options && comp.version_options.length) {
+      const def = comp.version_options.find(o => o.default);
+      if (def) return String(def.version);
+      return String(comp.version_options[0].version);
+    }
+    return comp.version ? String(comp.version) : null;
+  }
+
+  // Returns the cart ID for a comp's default version. Some version options
+  // map to a different component ID (e.g. Spark+Hudi default → spark-hudi).
   function _effectiveCartId(comp) {
     if (!comp.version_options || comp.version_options.length <= 1) return comp.id;
-    const selVer = _getSelectedVersion(comp.id);
-    const opt = comp.version_options.find(o => o.version === selVer);
-    return (opt && opt.cart_id) ? opt.cart_id : comp.id;
+    const def = comp.version_options.find(o => o.default) || comp.version_options[0];
+    return (def && def.cart_id) ? def.cart_id : comp.id;
   }
 
   // A component is "added" if its own id OR any version option's cart_id is in cart.
@@ -2634,255 +2634,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     return false;
   }
 
-  // Sync selectedVersions so that if a version option's cart_id is in cart,
-  // the dropdown shows the right version (e.g. hudi-v1 in cart → show 1.0.1).
-  function _syncVersionsFromCart() {
-    (state.catalog && state.catalog.categories || []).forEach(cat => {
-      (cat.components || []).forEach(comp => {
-        if (!comp.version_options) return;
-        for (const opt of comp.version_options) {
-          if (opt.cart_id && state.cart.includes(opt.cart_id) && !state.selectedVersions[comp.id]) {
-            state.selectedVersions[comp.id] = opt.version;
-          }
-        }
-      });
-    });
-  }
-
-  // ---- Version helpers (dynamic + catalog fallback) ----
-
-  function _getAllKnownVersions(compId) {
-    // Returns all known version strings for a component (dynamic + catalog static)
-    const versions = [];
-    const seen = new Set();
-    for (const v of (state.dynamicVersions[compId] || [])) {
-      if (!seen.has(v.version)) { versions.push(v.version); seen.add(v.version); }
-    }
-    const comp = _findComponent(compId);
-    for (const opt of (comp?.version_options || [])) {
-      const vs = String(opt.version);
-      if (!seen.has(vs)) { versions.push(vs); seen.add(vs); }
-    }
-    return versions;
-  }
-
-  function _matchVersionPattern(version, pattern) {
-    // fnmatch-style: 3.4.* → regex ^3\.4\..*$   46* → ^46.*$
-    const reStr = '^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-    return new RegExp(reStr).test(version);
-  }
-
-  function _baseVersion(v) {
-    // "3.5.5_1.8.1" → "3.5.5",  "3.4.1" → "3.4.1"
-    return v.split(/[_+]/)[0];
-  }
-
-  function _getSelectedVersion(compId) {
-    if (state.selectedVersions[compId]) return state.selectedVersions[compId];
-    // Prefer dynamic default
-    const dynDef = (state.dynamicVersions[compId] || []).find(v => v.default);
-    if (dynDef) return dynDef.version;
-    const comp = _findComponent(compId);
-    if (!comp) return null;
-    if (comp.version_options) {
-      const def = comp.version_options.find(o => o.default);
-      if (def) return String(def.version);
-      if (comp.version_options[0]) return String(comp.version_options[0].version);
-    }
-    return comp.version ? String(comp.version) : null;
-  }
-
-  function _getAllowedVersions(compId) {
-    // Returns a Set<string> of allowed version strings for compId given current anchor
-    // selections, or null when no constraint applies.
-    let allowed = null;
-
-    (state.catalog.categories || []).forEach(cat => {
-      (cat.components || []).forEach(anchor => {
-        const anchorVer = _getSelectedVersion(anchor.id);
-        if (!anchorVer) return;
-        const baseAnchorVer = _baseVersion(anchorVer);
-
-        // ── Dynamic compat rules (from /api/compat-rules) ──────────────────
-        const rule = (state.compatRules || []).find(r =>
-          r.anchor === anchor.id && _matchVersionPattern(baseAnchorVer, r.anchor_pattern)
-        );
-        if (rule && rule.compat && rule.compat[compId]) {
-          const patterns = rule.compat[compId];
-          const allVers = _getAllKnownVersions(compId);
-          const matches = allVers.filter(v =>
-            patterns.some(pat => _matchVersionPattern(_baseVersion(v), pat))
-          );
-          if (allowed === null) {
-            allowed = new Set(matches);
-          } else {
-            allowed = new Set([...allowed].filter(v => matches.includes(v)));
-          }
-          return;
-        }
-
-        // ── Fallback: catalog static compatible_versions ───────────────────
-        if (!anchor.version_options) return;
-        const opt = anchor.version_options.find(o => String(o.version) === anchorVer);
-        if (!opt?.compatible_versions?.[compId]) return;
-        const allowedList = opt.compatible_versions[compId];
-        if (allowed === null) {
-          allowed = new Set(allowedList);
-        } else {
-          allowed = new Set([...allowed].filter(v => allowedList.includes(v)));
-        }
-      });
-    });
-    return allowed;
-  }
-
-  function _bestCompatibleVersion(targetId, patterns) {
-    // Returns the newest compatible version for targetId given the compat patterns.
-    // Strategy: allVersions is sorted newest-first; take the first match.
-    const allVers = _getAllKnownVersions(targetId);
-    return allVers.find(v => patterns.some(pat => _matchVersionPattern(_baseVersion(v), pat))) || null;
-  }
-
-  function applyVersionCascade(changedCompId, newVersion) {
-    state.selectedVersions[changedCompId] = newVersion;
-    const baseNewVer = _baseVersion(newVersion);
-    const autoUpdated = []; // [{id, oldVersion, newVersion, compName}]
-
-    // ── Smart auto-select: scan ALL components and pick best compatible version ──
-    // When you pick an anchor (e.g. HDFS 3.4.1), every component in the compat
-    // map gets auto-updated to its best (newest) compatible version.
-    (state.compatRules || []).forEach(rule => {
-      if (rule.anchor !== changedCompId) return;
-      if (!_matchVersionPattern(baseNewVer, rule.anchor_pattern)) return;
-
-      Object.entries(rule.compat || {}).forEach(([targetId, patterns]) => {
-        const bestVer = _bestCompatibleVersion(targetId, patterns);
-        if (!bestVer) return;
-        const prevVer = state.selectedVersions[targetId];
-        if (prevVer === bestVer) return; // already on best — no change needed
-        state.selectedVersions[targetId] = bestVer;
-        const comp = _findComponent(targetId);
-        autoUpdated.push({
-          id: targetId,
-          oldVersion: prevVer,
-          newVersion: bestVer,
-          compName: comp?.name || targetId,
-        });
-      });
-    });
-
-    // ── Fallback: catalog static compatible_versions for components not in rules ──
-    const changedComp = _findComponent(changedCompId);
-    if (changedComp?.version_options) {
-      const opt = changedComp.version_options.find(o => String(o.version) === newVersion);
-      if (opt?.compatible_versions) {
-        Object.entries(opt.compatible_versions).forEach(([targetId, allowedVersions]) => {
-          if (!state.selectedVersions[targetId]) {
-            state.selectedVersions[targetId] = allowedVersions[0] || null;
-          }
-        });
-      }
-    }
-
-    renderCatalog();
-
-    // ── Show toast listing what was auto-selected ──────────────────────────────
-    if (autoUpdated.length > 0) {
-      _showCascadeToast(changedCompId, newVersion, autoUpdated);
-    }
-  }
-
-  function _showCascadeToast(anchorId, anchorVersion, updates, isAI = false) {
-    const prev = document.getElementById('cascade-toast');
-    if (prev) prev.remove();
-
-    const toast = document.createElement('div');
-    toast.id = 'cascade-toast';
-    const borderColor = isAI ? 'rgba(99,102,241,0.45)' : 'rgba(6,182,212,0.35)';
-    toast.style.cssText = [
-      'position:fixed', 'bottom:28px', 'left:50%', 'transform:translateX(-50%)',
-      'background:#0b1929', `border:1px solid ${borderColor}`,
-      'border-radius:12px', 'padding:14px 18px', 'z-index:99999',
-      'box-shadow:0 12px 40px rgba(0,0,0,0.7)', 'min-width:280px', 'max-width:460px',
-      'animation:cascadeToastIn 0.22s ease',
-    ].join(';');
-
-    const anchorComp = _findComponent(anchorId);
-    const anchorName = anchorComp?.name || anchorId;
-
-    const rows = updates.slice(0, 8).map(u => `
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:5px">
-        <span style="color:#94a3b8;font-size:11px">${esc(u.compName)}</span>
-        <span style="display:flex;align-items:center;gap:5px;font-size:10px;font-family:monospace">
-          ${u.oldVersion ? `<span style="color:rgba(148,163,184,0.35);text-decoration:line-through">${esc(u.oldVersion)}</span>` : ''}
-          <span style="color:#67e8f9">${esc(u.newVersion)}</span>
-        </span>
-      </div>`).join('');
-    const more = updates.length > 8
-      ? `<div style="color:rgba(148,163,184,0.4);font-size:10px;margin-top:4px">+${updates.length - 8} more updated</div>` : '';
-
-    const icon = isAI ? '✦' : '⚡';
-    const label = isAI
-      ? `AI-researched for <span style="color:#a5b4fc;font-family:monospace">${esc(anchorName)} ${esc(anchorVersion)}</span>`
-      : `Auto-configured for <span style="color:#67e8f9;font-family:monospace">${esc(anchorName)} ${esc(anchorVersion)}</span>`;
-    const footer = isAI
-      ? 'Researched by AI (gpt-4o-mini) • click any badge to override'
-      : 'Compatible versions auto-selected • click any badge to change';
-    toast.innerHTML = `
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <span style="font-size:13px">${icon}</span>
-        <span style="font-size:12px;font-weight:600;color:#e2e8f0">${label}</span>
-      </div>
-      <div style="border-top:1px solid rgba(255,255,255,0.07);padding-top:6px">${rows}${more}</div>
-      <div style="margin-top:8px;font-size:10px;color:rgba(148,163,184,0.4)">${footer}</div>`;
-
-    document.body.appendChild(toast);
-    setTimeout(() => {
-      toast.style.transition = 'opacity 0.4s';
-      toast.style.opacity = '0';
-      setTimeout(() => toast.remove(), 420);
-    }, 5000);
-  }
-
-  // ---- Dynamic version loading ----
-
-  async function loadCompatRules() {
-    try {
-      const r = await fetch('/api/compat-rules');
-      if (r.ok) { const d = await r.json(); state.compatRules = d.rules || []; }
-    } catch (e) { console.warn('compat-rules fetch failed', e); }
-  }
-
-  async function loadVersionsForComponent(compId) {
-    if (state.versionsLoading.has(compId)) return;
-    state.versionsLoading.add(compId);
-    try {
-      const r = await fetch(`/api/versions/${encodeURIComponent(compId)}`);
-      if (r.ok) {
-        const d = await r.json();
-        state.dynamicVersions[compId] = d.versions || [];
-      }
-    } catch (e) { console.warn(`versions/${compId} fetch failed`, e); }
-    finally {
-      state.versionsLoading.delete(compId);
-      renderCatalog();
-    }
-  }
-
-  async function loadAllCatalogVersions() {
-    await loadCompatRules();
-    const ids = [];
-    (state.catalog?.categories || []).forEach(cat =>
-      (cat.components || []).filter(c => !c.hidden).forEach(c => ids.push(c.id))
-    );
-    // Fetch in batches of 5 to avoid stampeding the server
-    for (let i = 0; i < ids.length; i += 5) {
-      await Promise.all(ids.slice(i, i + 5).map(loadVersionsForComponent));
-    }
-  }
-
   function renderCatalog() {
-    _syncVersionsFromCart();
     const wrap = document.getElementById("catalog-list"); wrap.innerHTML = "";
     (state.catalog.categories || []).forEach((cat) => {
       const visibleComps = (cat.components || []).filter(c => !c.hidden);
@@ -2910,75 +2662,13 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
 
         const tagline = (activeOpt && activeOpt.tagline) || comp.tagline || comp.summary || '';
 
-        let versionDropdown = '';
-        let versionPill = '';
-        {
-          // Merge dynamic + catalog version options for the picker
-          const dynVers = state.dynamicVersions[comp.id] || [];
-          const isLoading = state.versionsLoading.has(comp.id);
-          const seenVers = new Set(dynVers.map(v => v.version));
-          const allVersions = [...dynVers];
-          for (const opt of (comp.version_options || [])) {
-            const vs = String(opt.version);
-            if (!seenVers.has(vs)) {
-              allVersions.push({ version: vs, label: opt.label || vs, source: 'catalog',
-                badges: opt.badges, tagline: opt.tagline, cart_id: opt.cart_id });
-              seenVers.add(vs);
-            }
-          }
-
-          if (allVersions.length > 1 || isLoading) {
-            const selectedVer = _getSelectedVersion(comp.id);
-            const allowed = _getAllowedVersions(comp.id);
-            const compatCount = allowed ? allVersions.filter(v => [...allowed].some(av => av === v.version || _baseVersion(av) === _baseVersion(v.version))).length : allVersions.length;
-            const rows = allVersions.map(v => {
-              const baseV = _baseVersion(v.version);
-              const isAllowed = !allowed || [...allowed].some(av => av === v.version || _baseVersion(av) === baseV);
-              const isSel = v.version === selectedVer;
-              const dateStr = v.release_date ? v.release_date.slice(0, 7) : '';
-              const srcIcon = v.source === 'apache' ? '⬆' : v.source === 'github' ? '⎇' : v.source === 'dockerhub' ? '⬡' : '';
-              return `<div class="ver-opt" data-version="${esc(v.version)}" data-comp="${esc(comp.id)}"
-                style="display:flex;align-items:center;justify-content:space-between;padding:4px 10px;cursor:${isAllowed?'pointer':'default'};
-                  background:${isSel?'rgba(6,182,212,0.12)':'transparent'};
-                  border-left:2px solid ${isSel?'#06b6d4':'transparent'}">
-                <span style="font-family:monospace;font-size:11px;color:${isAllowed?(isSel?'#67e8f9':'#cbd5e1'):'rgba(148,163,184,0.35)'}">${esc(v.label||v.version)}</span>
-                <span style="font-size:9px;color:rgba(148,163,184,0.4);margin-left:6px;white-space:nowrap">${dateStr}${!isAllowed?' <span style="color:#ef4444">✗</span>':''} ${srcIcon}</span>
-              </div>`;
-            }).join('');
-            const countLabel = isLoading ? 'loading…' : `${allVersions.length} version${allVersions.length!==1?'s':''}${allowed&&compatCount<allVersions.length?' · '+compatCount+' compatible':''}`;
-            versionDropdown = `<div class="ver-wrap" style="position:relative;margin-top:4px" data-comp="${esc(comp.id)}">
-              <button class="ver-trigger" data-comp="${esc(comp.id)}"
-                style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 6px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:5px;color:#94a3b8;font-size:10px;font-family:monospace;cursor:pointer;user-select:none">
-                <span style="color:#67e8f9">v${esc(selectedVer||'?')}</span>
-                <span style="color:rgba(148,163,184,0.4);font-size:9px">${isLoading?'↻':'▾'}</span>
-                <span style="color:rgba(148,163,184,0.3);font-size:9px">${allVersions.length}</span>
-              </button>
-              <div class="ver-panel" data-comp="${esc(comp.id)}" style="display:none;position:absolute;z-index:9999;left:0;top:calc(100% + 4px);min-width:210px;max-width:260px;background:#0d1526;border:1px solid rgba(255,255,255,0.15);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.7);overflow:hidden">
-                <div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.08)">
-                  <input class="ver-search" data-comp="${esc(comp.id)}" placeholder="🔍 search version…"
-                    style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e2e8f0;font-size:11px;padding:4px 8px;outline:none;font-family:monospace">
-                </div>
-                <div class="ver-list" style="overflow-y:auto;max-height:200px">${rows}</div>
-                <div style="padding:4px 10px 5px;border-top:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:space-between;gap:4px">
-                  <span style="font-size:9px;color:rgba(148,163,184,0.35)">${countLabel}</span>
-                  <div style="display:flex;gap:4px;align-items:center">
-                    ${['spark-hudi','spark-delta'].includes(comp.id) ? `<button class="ver-build-btn" data-comp="${esc(comp.id)}" title="LLM-research version → docker build + push"
-                      style="font-size:9px;padding:2px 7px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);border-radius:4px;color:#6ee7b7;cursor:pointer;font-family:monospace;white-space:nowrap">
-                      ⚙ Build Image
-                    </button>` : ''}
-                    <button class="ver-ai-btn" data-comp="${esc(comp.id)}" title="AI-research best compatible versions for all components"
-                      style="font-size:9px;padding:2px 7px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.35);border-radius:4px;color:#a5b4fc;cursor:pointer;font-family:monospace;white-space:nowrap">
-                      ✦ AI Auto-select
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>`;
-          } else {
-            const ver = (allVersions[0]?.version) || comp.version || '?';
-            versionPill = `<span class="text-[10px] mono shrink-0" style="color:rgba(148,163,184,0.45)">v${esc(String(ver))}</span>`;
-          }
-        }
+        // Version is fixed to the catalog default — no live fetch, no picker.
+        // "Tested" means "what Studio certified," so the only choice surfaced
+        // here is the one version_options/version actually marks as default.
+        const _defaultVer = _getSelectedVersion(comp.id);
+        const versionPill = _defaultVer
+          ? `<span class="text-[10px] mono shrink-0" style="color:rgba(148,163,184,0.45)">v${esc(_defaultVer)}</span>`
+          : '';
 
         return `
           <div class="comp-card flex items-center gap-3 px-3 py-2.5 rounded-lg mb-1.5 ${added ? 'bg-emerald-500/8 border border-emerald-500/25' : 'bg-white/[0.02] border border-white/5'}">
@@ -2992,7 +2682,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
                 ${badges}
               </div>
               <div class="text-xs leading-tight truncate" style="color:rgba(148,163,184,0.7);margin-top:1px">${esc(tagline)}</div>
-              ${versionDropdown}
             </div>
             <div class="shrink-0 flex flex-col items-end gap-1.5">
               <button class="cart-btn text-xs px-2.5 py-1 rounded font-medium transition-colors whitespace-nowrap ${added ? 'border hover:bg-rose-500/15 hover:text-rose-300 hover:border-rose-500/30' : 'bg-cyan-500/90 text-slate-900 hover:bg-cyan-400'}" style="${added ? 'background:rgba(255,255,255,0.06);color:#94a3b8;border-color:rgba(255,255,255,0.1)' : ''}" data-comp="${esc(comp.id)}">${added ? '✓ Added' : '+ Add'}</button>
@@ -3049,141 +2738,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
         showComponentDetails(b.dataset.comp);
       });
     });
-    // Wire version dropdown trigger buttons
-    wrap.querySelectorAll(".ver-trigger").forEach(btn => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const compId = btn.dataset.comp;
-        const panel = wrap.querySelector(`.ver-panel[data-comp="${compId}"]`);
-        // Close any other open panels
-        wrap.querySelectorAll(".ver-panel").forEach(p => {
-          if (p !== panel) p.style.display = 'none';
-        });
-        if (!panel) return;
-        const isOpen = panel.style.display !== 'none';
-        panel.style.display = isOpen ? 'none' : 'block';
-        if (!isOpen) {
-          const si = panel.querySelector(".ver-search");
-          if (si) { si.value = ''; si.focus(); }
-          // Show all items
-          panel.querySelectorAll(".ver-opt").forEach(o => o.style.display = '');
-        }
-      });
-    });
-
-    // Wire version search inputs inside panels
-    wrap.querySelectorAll(".ver-search").forEach(si => {
-      si.addEventListener("input", () => {
-        const q = si.value.toLowerCase();
-        const panel = si.closest(".ver-panel");
-        if (!panel) return;
-        panel.querySelectorAll(".ver-opt").forEach(opt => {
-          const v = (opt.dataset.version || '').toLowerCase();
-          opt.style.display = v.includes(q) ? '' : 'none';
-        });
-      });
-      si.addEventListener("click", e => e.stopPropagation());
-    });
-
-    // Wire version option selections
-    wrap.querySelectorAll(".ver-opt").forEach(opt => {
-      opt.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const version = opt.dataset.version;
-        const compId = opt.dataset.comp;
-        if (!version || !compId) return;
-        // Close the panel
-        const panel = opt.closest(".ver-panel");
-        if (panel) panel.style.display = 'none';
-        applyVersionCascade(compId, version);
-      });
-      opt.addEventListener("mouseenter", () => {
-        opt.style.background = opt.style.background.includes('06b6d4') ? opt.style.background : 'rgba(255,255,255,0.05)';
-      });
-      opt.addEventListener("mouseleave", () => {
-        const isSel = opt.dataset.version === _getSelectedVersion(opt.dataset.comp);
-        opt.style.background = isSel ? 'rgba(6,182,212,0.12)' : 'transparent';
-      });
-    });
-
-    // Wire Build Image buttons
-    wrap.querySelectorAll(".ver-build-btn").forEach(btn => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        wrap.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
-        _openBuildModal(btn.dataset.comp);
-      });
-    });
-
-    // Wire AI Auto-select buttons
-    wrap.querySelectorAll(".ver-ai-btn").forEach(btn => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const compId = btn.dataset.comp;
-        const anchorVersion = _getSelectedVersion(compId);
-        if (!anchorVersion) return;
-
-        // Close the open panel
-        wrap.querySelectorAll(".ver-panel").forEach(p => p.style.display = 'none');
-
-        // Visual feedback
-        btn.textContent = '✦ Researching…';
-        btn.style.opacity = '0.6';
-        btn.disabled = true;
-
-        _showAiResearchingToast(compId, anchorVersion);
-
-        try {
-          const res = await fetch('/api/compat-ai/research', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ anchor_id: compId, anchor_version: anchorVersion }),
-          });
-          const data = await res.json();
-          if (data.error) throw new Error(data.error);
-
-          const aiCompat = data.compat || {};
-          const autoUpdated = [];
-          Object.entries(aiCompat).forEach(([targetId, bestVer]) => {
-            const prev = state.selectedVersions[targetId];
-            if (prev === bestVer) return;
-            state.selectedVersions[targetId] = bestVer;
-            const comp = _findComponent(targetId);
-            autoUpdated.push({ id: targetId, oldVersion: prev, newVersion: bestVer, compName: comp?.name || targetId });
-          });
-
-          renderCatalog();
-          _showCascadeToast(compId, anchorVersion, autoUpdated, /* isAI */ true);
-        } catch (err) {
-          _showAiErrorToast(String(err));
-        }
-
-        btn.textContent = '✦ AI Auto-select';
-        btn.style.opacity = '';
-        btn.disabled = false;
-      });
-    });
-  }
-
-  function _showAiResearchingToast(compId, version) {
-    const prev = document.getElementById('cascade-toast');
-    if (prev) prev.remove();
-    const toast = document.createElement('div');
-    toast.id = 'cascade-toast';
-    toast.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#0b1929;border:1px solid rgba(99,102,241,0.4);border-radius:12px;padding:12px 20px;z-index:99999;box-shadow:0 12px 40px rgba(0,0,0,0.7);font-size:12px;color:#a5b4fc;animation:cascadeToastIn 0.22s ease;display:flex;align-items:center;gap:8px';
-    toast.innerHTML = `<span style="animation:pulse 1s infinite;display:inline-block">✦</span> AI researching best compatible versions for <span style="font-family:monospace;color:#67e8f9">${esc(compId)} ${esc(version)}</span>…`;
-    document.body.appendChild(toast);
-  }
-
-  function _showAiErrorToast(errMsg) {
-    const prev = document.getElementById('cascade-toast');
-    if (prev) prev.remove();
-    const toast = document.createElement('div');
-    toast.id = 'cascade-toast';
-    toast.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#1a0b0b;border:1px solid rgba(239,68,68,0.4);border-radius:12px;padding:12px 20px;z-index:99999;box-shadow:0 12px 40px rgba(0,0,0,0.7);font-size:12px;color:#fca5a5;animation:cascadeToastIn 0.22s ease';
-    toast.innerHTML = `✗ AI research failed: ${esc(errMsg)}`;
-    document.body.appendChild(toast);
-    setTimeout(() => { toast.style.transition='opacity 0.4s'; toast.style.opacity='0'; setTimeout(()=>toast.remove(),420); }, 4000);
   }
 
   // ---- Image Build Modal ----
@@ -3473,7 +3027,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
   let _sbSelected = new Set();  // user-selected component IDs
   let _sbResolved = [];         // resolved + auto-added
   let _sbAutoAdded = [];        // auto-added only
-  let _sbVersions = {};         // {id: version}
   let _sbEvtSource = null;
 
   // ── open/close ──────────────────────────────────────────────────────────
@@ -3600,7 +3153,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     _sbRenderCatalog(document.getElementById('sb-search').value);
     _sbRenderSelected();
     _sbRenderAuto();
-    _sbRenderVersions();
     _sbCheckConflicts();
 
     const hasSelection = _sbSelected.size > 0;
@@ -3627,7 +3179,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
                     style="background:rgba(168,85,247,0.08);border:1px solid rgba(168,85,247,0.2)">
         <div>
           <span class="text-sm font-medium text-violet-300">${esc(comp.name)}</span>
-          <span class="text-xs text-slate-500 ml-2 mono">${esc(_sbVersions[id] || comp.version)}</span>
+          <span class="text-xs text-slate-500 ml-2 mono">${esc(comp.version)}</span>
         </div>
         <button onclick="_sbToggle('${id}')" class="text-slate-500 hover:text-rose-400 text-xs transition-colors">✕</button>
       </div>`;
@@ -3644,32 +3196,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       const comp = _sbCatalog.find(c => c.id === id);
       return `<span class="text-xs px-2 py-1 rounded-full" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#a5b4fc">${esc(comp ? comp.name : id)}</span>`;
     }).join('');
-  }
-
-  function _sbRenderVersions() {
-    const panel = document.getElementById('sb-versions-panel');
-    if (_sbSelected.size === 0) {
-      panel.innerHTML = '<div class="text-xs text-slate-500 italic">Select components first to see version pickers</div>';
-      return;
-    }
-    let html = '';
-    for (const id of [..._sbSelected]) {
-      const comp = _sbCatalog.find(c => c.id === id);
-      if (!comp) continue;
-      const cur = _sbVersions[id] || comp.version;
-      html += `<div class="flex items-center gap-3">
-        <span class="text-xs text-slate-400 w-32 truncate">${esc(comp.name)}</span>
-        <input type="text" value="${esc(cur)}" data-comp-id="${esc(id)}"
-               class="sb-ver-input flex-1 text-xs px-2 py-1 rounded mono"
-               style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;outline:none">
-      </div>`;
-    }
-    panel.innerHTML = html;
-    panel.querySelectorAll('.sb-ver-input').forEach(inp => {
-      inp.addEventListener('change', () => {
-        _sbVersions[inp.dataset.compId] = inp.value.trim();
-      });
-    });
   }
 
   function _sbCheckConflicts() {
@@ -3701,14 +3227,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     _sbRenderCatalog(e.target.value);
   });
 
-  // ── versions toggle ───────────────────────────────────────────────────
-  document.getElementById('sb-versions-toggle').addEventListener('click', () => {
-    const panel = document.getElementById('sb-versions-panel');
-    const arrow = document.getElementById('sb-versions-arrow');
-    const hidden = panel.classList.toggle('hidden');
-    arrow.textContent = hidden ? '▶' : '▼';
-  });
-
   // ── compose preview ───────────────────────────────────────────────────
   document.getElementById('sb-preview-btn').addEventListener('click', async () => {
     const panel = document.getElementById('sb-compose-panel');
@@ -3719,7 +3237,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       const r = await fetch('/api/stack-builder/compose-preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ selected: [..._sbSelected], versions: _sbVersions }),
+        body: JSON.stringify({ selected: [..._sbSelected] }),
       });
       const d = await r.json();
       document.getElementById('sb-compose-code').textContent = d.compose_yaml || '';
@@ -3761,12 +3279,46 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     _sbRunBuild(_sbLastBuildParams);
   }
 
+  // Batched log appender — coalesces bursts of log lines into a single DOM
+  // flush per animation frame. A chatty install (hundreds of lines/sec during
+  // docker pulls) otherwise triggers one synchronous reflow per line via
+  // scrollTop, which freezes the browser main thread ("screen unresponsive").
+  // Also caps the line count so long installs don't grow the DOM unbounded.
+  const _logBatchers = new WeakMap();
+  function _batchLogLine(containerEl, scrollEl, cls, text) {
+    if (!containerEl) return;
+    let b = _logBatchers.get(containerEl);
+    if (!b) { b = { queue: [], scheduled: false }; _logBatchers.set(containerEl, b); }
+    b.queue.push({ cls, text });
+    if (b.scheduled) return;
+    b.scheduled = true;
+    requestAnimationFrame(() => {
+      b.scheduled = false;
+      if (!b.queue.length) return;
+      const frag = document.createDocumentFragment();
+      for (const it of b.queue) {
+        const d = document.createElement('div');
+        if (it.cls) d.className = it.cls;
+        d.textContent = it.text;
+        frag.appendChild(d);
+      }
+      b.queue = [];
+      containerEl.appendChild(frag);
+      while (containerEl.children.length > 4000) containerEl.removeChild(containerEl.firstChild);
+      const s = scrollEl || containerEl;
+      s.scrollTop = s.scrollHeight;
+    });
+  }
+  function _clearLogBatcher(containerEl) {
+    const b = containerEl && _logBatchers.get(containerEl);
+    if (b) b.queue = [];
+  }
+
   function _sbProgLog(line) {
-    const inner = document.getElementById('sb-prog-log-inner');
-    const el = document.createElement('div');
-    el.textContent = line;
-    inner.appendChild(el);
-    document.getElementById('sb-prog-log').scrollTop = 1e9;
+    _batchLogLine(
+      document.getElementById('sb-prog-log-inner'),
+      document.getElementById('sb-prog-log'),
+      '', line);
   }
 
   function _sbProgRenderPhases(phaseStates) {
@@ -3915,7 +3467,6 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     const stackName = document.getElementById('sb-stack-name').value.trim() || 'custom-lakehouse';
     _sbLastBuildParams = {
       selected:   [..._sbSelected],
-      versions:   { ..._sbVersions },
       stack_name: stackName,
     };
 
@@ -4013,7 +3564,8 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     logoImg.src = comp.logo || `/assets/logos/${comp.id}.svg`;
     logoImg.style.display = "";
     document.getElementById("comp-modal-name").textContent = comp.name || comp.id;
-    document.getElementById("comp-modal-version").textContent = comp.version ? `v${comp.version}` : '';
+    const _modalVer = _getSelectedVersion(comp.id);
+    document.getElementById("comp-modal-version").textContent = _modalVer ? `v${_modalVer}` : '';
     document.getElementById("comp-modal-tagline").textContent = comp.tagline || comp.summary || '';
     const badgesEl = document.getElementById("comp-modal-badges");
     badgesEl.innerHTML = (comp.badges || []).map(b => {
@@ -4037,12 +3589,16 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     const urlEl = document.getElementById("comp-modal-url");
     urlEl.href = comp.url || "#";
     const addBtn = document.getElementById("comp-modal-add");
-    const isAdded = state.cart.includes(compId);
+    const isAdded = _isAdded(comp);
     addBtn.textContent = isAdded ? "✓ Remove from cart" : "Add to cart";
     addBtn.className = isAdded ? "btn-ghost text-sm" : "btn-primary text-sm";
     addBtn.onclick = async () => {
-      if (state.cart.includes(compId)) state.cart = state.cart.filter(x => x !== compId);
-      else state.cart = [...state.cart, compId];
+      if (_isAdded(comp)) {
+        const relatedIds = [comp.id, ...(comp.version_options || []).map(o => o.cart_id).filter(Boolean)];
+        state.cart = state.cart.filter(id => !relatedIds.includes(id));
+      } else {
+        state.cart = [...state.cart, _effectiveCartId(comp)];
+      }
       _hideCompModal();
       renderCatalog();
       await refreshCartValidation();
@@ -4118,7 +3674,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     document.getElementById("sizing-ram").textContent  = t.ram_gb  ?? "—";
     document.getElementById("sizing-disk").textContent = t.disk_gb ?? "—";
     const hint = (sizing.tiers.recommended.cheapest_overall)
-      ? `Fits cheapest VPS: ${sizing.tiers.recommended.cheapest_overall.provider} ${sizing.tiers.recommended.cheapest_overall.plan} (~$${sizing.tiers.recommended.cheapest_overall.monthly_usd}/mo)`
+      ? `Fits cheapest VPS: ${sizing.tiers.recommended.cheapest_overall.provider_name} ${sizing.tiers.recommended.cheapest_overall.plan} (~$${sizing.tiers.recommended.cheapest_overall.usd_month}/mo)`
       : `Full UDP stack — minimal tier exists for smaller VPSes.`;
     document.getElementById("sizing-hint").textContent = hint;
   }
@@ -4190,11 +3746,19 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     state.cart = []; renderCatalog(); await refreshCartValidation();
   });
   document.getElementById("btn-cart-recommend").addEventListener("click", async () => {
-    const r = await api("/api/cart/recommended");
+    // Recommend the set for the CURRENT template/goal — not a fixed Iceberg cart.
+    const qs = state.template ? `?template=${encodeURIComponent(state.template)}`
+             : state.goal     ? `?goal=${encodeURIComponent(state.goal)}`
+             : "";
+    const r = await api("/api/cart/recommended" + qs);
     state.cart = r.cart; renderCatalog(); await refreshCartValidation();
   });
   document.getElementById("btn-build-continue").addEventListener("click", async () => {
     if (!state.cartValidation?.complete) return;
+    if (!state.templateStackId && state.template) {
+      showToast("This template doesn't have an installable stack yet — it's on the roadmap.", "warn");
+      return;
+    }
     // Load sizing for the underlying stack (UDP)
     await loadNameScreen();
     navigate("name");
@@ -4288,7 +3852,14 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
   });
   document.getElementById("btn-name-continue").addEventListener("click", async () => {
     if (!state.lakeName) return;
-    const stackId = state.templateStackId || "udp-local-v0.2";
+    // A template's cart only maps to a real install if its recommended_set
+    // carries a certified stack_id. Guard here as a second line of defence
+    // (backend also sets installable:false when stack_id is absent).
+    if (!state.templateStackId) {
+      showToast("This template doesn't have an installable stack yet — it's on the roadmap.", "warn");
+      return;
+    }
+    const stackId = state.templateStackId;
     // Fetch full stack metadata so install_dir and mode are available downstream.
     try {
       const stacks = await api("/api/stacks");
@@ -4445,8 +4016,17 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
   document.getElementById("btn-to-server").addEventListener("click", () => navigate("server"));
 
   // ----- server / inspect -----
+  // The address the browser used to reach Studio == the server Studio runs on.
+  // Installs against THAT host run locally on the server (no SSH); only a
+  // DIFFERENT host is a genuine remote target. This is generic — it adapts to
+  // localhost, an office FQDN, or a bare IP with no hardcoding.
+  function _studioOrigin() {
+    return (window.location.hostname || "").trim();
+  }
   function _isLocalHost(h) {
-    return !h || h === "localhost" || h === "127.0.0.1" || h === "::1";
+    const self = _studioOrigin();
+    return !h || h === "localhost" || h === "127.0.0.1" || h === "::1"
+           || (!!self && h === self);
   }
 
   function onHostChange() {
@@ -4458,7 +4038,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     if (isLocal) {
       sshForm.classList.add("hidden");
       sshNote.classList.remove("hidden");
-      badge.textContent = "localhost · not required";
+      // "this server" is accurate whether the host is localhost or the FQDN
+      // Studio is being served from.
+      badge.textContent = "this server · no SSH required";
       badge.className = "text-xs px-2 py-0.5 rounded-md bg-slate-700/60 text-slate-400";
     } else {
       sshForm.classList.remove("hidden");
@@ -4467,6 +4049,17 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       badge.className = "text-xs px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/30";
     }
   }
+
+  // Generic default: prefill Host with the same address the browser used to
+  // reach Studio, so post-install service URLs (MinIO, StarRocks, Trino …) are
+  // clickable from wherever the operator sits — no hardcoded server name.
+  (function _defaultHostToStudioOrigin() {
+    const el = document.getElementById("input-host");
+    if (!el) return;
+    const h = _studioOrigin();
+    if (h) el.value = h;
+    onHostChange();
+  })();
 
   document.getElementById("btn-inspect").addEventListener("click", () => {
     state.host = document.getElementById("input-host").value.trim() || "localhost";
@@ -4581,7 +4174,30 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
         el.appendChild(div);
       }
     }
+    renderRunningControls(rec);
     renderFailureControls(rec);
+  }
+
+  const RUNNING_STATES = new Set(["STARTING_STACK", "BOOTSTRAPPING", "RUNNING", "SMOKING", "FINALIZING"]);
+  function renderRunningControls(rec) {
+    const wrap = document.getElementById("running-controls");
+    if (!RUNNING_STATES.has(rec.state)) { wrap.classList.add("hidden"); return; }
+    wrap.classList.remove("hidden");
+    wrap.innerHTML = `
+      <button id="btn-stop-install" class="w-full px-3 py-2 rounded-lg text-sm flex items-center justify-center gap-2"
+        style="background:rgba(244,63,94,0.12);border:1px solid rgba(244,63,94,0.35);color:#fca5a5;">
+        ⏹ Stop install
+      </button>
+    `;
+    document.getElementById("btn-stop-install").addEventListener("click", async () => {
+      if (!confirm("Stop this install? Docker containers will be left as-is — use Rollback afterwards to clean them up.")) return;
+      const btn = document.getElementById("btn-stop-install");
+      btn.disabled = true; btn.textContent = "Stopping…";
+      try {
+        await api(`/api/installs/${state.installId}/cancel`, { method: "POST" });
+        setTimeout(() => refreshInstall(state.installId), 800);
+      } catch (e) { alert(e.message); btn.disabled = false; btn.textContent = "⏹ Stop install"; }
+    });
   }
 
   const SKIPPABLE_STEPS = new Set(["smoke", "finalize", "verify"]);
@@ -4741,7 +4357,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       }
       if (evt.kind === "reset") {
         // Server says our resume point was too old; clear local log.
-        if (logEl) logEl.innerHTML = "";
+        if (logEl) { _clearLogBatcher(logEl); logEl.innerHTML = ""; }
         state._wsLastSeq[id] = 0;
         return;
       }
@@ -4787,12 +4403,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
 
   function handleEvent(evt, logEl) {
     if (evt.kind === "log") {
-      const div = document.createElement("div");
-      div.className = "log-line " + (evt.stream === "stderr" ? "text-amber-300" : "text-slate-300");
-      div.textContent = evt.line;
-      logEl.appendChild(div);
-      if (logEl.children.length > 4000) logEl.removeChild(logEl.firstChild);
-      logEl.scrollTop = logEl.scrollHeight;
+      _batchLogLine(logEl, logEl,
+        "log-line " + (evt.stream === "stderr" ? "text-amber-300" : "text-slate-300"),
+        evt.line);
       document.getElementById("log-step").textContent = evt.step || "";
     } else if (evt.kind === "step_start") { updateStepUI(evt.step, "running"); }
     else if (evt.kind === "step_end") { updateStepUI(evt.step, evt.status === "success" ? "success" : "failed"); }
@@ -4808,7 +4421,7 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     } else if (evt.kind === "result") {
       if (state.installRecord) state.installRecord.outputs = evt.payload || {};
     } else if (evt.kind === "error") {
-      const div = document.createElement("div"); div.className = "log-line text-rose-400"; div.textContent = "ERROR: " + (evt.line || ""); logEl.appendChild(div); logEl.scrollTop = logEl.scrollHeight;
+      _batchLogLine(logEl, logEl, "log-line text-rose-400", "ERROR: " + (evt.line || ""));
     }
   }
 
@@ -4834,6 +4447,8 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
       document.getElementById("first-action-title").textContent = "Start using your lakehouse";
     }
     renderFirstActions(rec);
+
+    
     const urls = document.getElementById("success-urls"); urls.innerHTML = "";
     Object.values(rec.outputs?.urls || {}).forEach(u => {
       const a = document.createElement("a");

@@ -23,11 +23,41 @@ from typing import AsyncGenerator
 from .component_registry import COMPONENTS, resolve_dependencies, get_live_versions
 from . import stack_composer, ai_configurator, version_fetcher, compat_ai
 from .config import WORK_DIR
+from .state import store
+from .models import StepStatus
 
 _CUSTOM_JOBS: dict[str, "CustomStackJob"] = {}
 
 # Phase display order
 _PHASES = ["versions", "resolve", "compose", "ai_config", "write_files", "start", "post_cfg", "verify", "summary"]
+
+# Human titles for the Install History step list (mirrors manifest-based installs).
+_PHASE_TITLES = {
+    "versions":    "Resolve versions",
+    "resolve":     "Resolve dependencies",
+    "compose":     "Generate docker-compose",
+    "ai_config":   "Generate service configs",
+    "write_files": "Write config files",
+    "start":       "Start stack (docker compose up)",
+    "post_cfg":    "Post-start configuration",
+    "verify":      "Verify health",
+    "summary":     "Capture outputs",
+}
+
+# Custom-build phase → InstallState so the Install History pill matches the
+# manifest-based lifecycle. Any non-terminal state keeps the record in
+# RUNNING_STATES, which correctly blocks uninstall until the build settles.
+_PHASE_TO_STATE = {
+    "versions":    "READY_TO_INSTALL",
+    "resolve":     "READY_TO_INSTALL",
+    "compose":     "WRITING_ENV",
+    "ai_config":   "WRITING_ENV",
+    "write_files": "WRITING_ENV",
+    "start":       "STARTING_STACK",
+    "post_cfg":    "BOOTSTRAPPING",
+    "verify":      "SMOKE_TESTING",
+    "summary":     "SMOKE_TESTING",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -103,10 +133,52 @@ class CustomStackJob:
         self.pipeline_example: str = ""
         self.config_plan: dict = {}
         self.error: str | None = None
-        self.install_dir: Path | None = None
+        # Known up-front (compose phase re-affirms it); needed now so the
+        # Install History record + uninstall can point at the compose dir.
+        self.install_dir: Path | None = WORK_DIR / self.stack_name
 
         self._events: asyncio.Queue = asyncio.Queue()
         self._done = False
+
+        # ── Register in Install History (state.store) ───────────────────────
+        # Quick Install and custom builds previously ran entirely off the
+        # in-memory job and never appeared in Install History, so their
+        # containers could only be removed by hand. Create a real InstallRecord
+        # (marked custom_build so uninstall uses `docker compose down`, not the
+        # manifest-based `./udp clean`) and keep its state in sync below.
+        self.store_install_id: str | None = None
+        try:
+            rec = store.create(
+                stack_id=self.stack_name,
+                host=(self.target.get("host") if self.is_remote else "localhost"),
+                install_dir=str(self.install_dir),
+                steps=[StepStatus(id=p, title=_PHASE_TITLES.get(p, p)) for p in _PHASES],
+                lake_name=self.stack_name,
+                cart=list(self.selected),
+            )
+            self.store_install_id = rec.install_id
+            store.set_outputs(rec.install_id, {"custom_build": True})
+        except Exception:
+            # Never let history bookkeeping break an install.
+            self.store_install_id = None
+
+    # ── Install History sync ─────────────────────────────────────────────────
+
+    def _store_state(self, state: str, error: str | None = None) -> None:
+        if self.store_install_id:
+            try:
+                store.update_state(self.store_install_id, state, error=error)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+    def _store_step(self, phase: str, status: str) -> None:
+        if self.store_install_id:
+            try:
+                store.update_step(self.store_install_id, phase, status=status,
+                                  finished_at=(time.time() if status in ("success", "failed") else None),
+                                  started_at=(time.time() if status == "running" else None))
+            except Exception:
+                pass
 
     # ── event helpers ───────────────────────────────────────────────────────
 
@@ -119,10 +191,13 @@ class CustomStackJob:
     def _phase_start(self, phase: str) -> None:
         self.current_phase = phase
         self.phase_states[phase] = "active"
+        self._store_step(phase, "running")
+        self._store_state(_PHASE_TO_STATE.get(phase, "STARTING_STACK"))
         self._emit("phase_start", phase=phase)
 
     def _phase_end(self, phase: str, ok: bool = True) -> None:
         self.phase_states[phase] = "done" if ok else "failed"
+        self._store_step(phase, "success" if ok else "failed")
         self._emit("phase_end", phase=phase, ok=ok)
 
     async def stream_events(self) -> AsyncGenerator[str, None]:
@@ -142,12 +217,16 @@ class CustomStackJob:
         self.state = "running"
         try:
             await self._run_phases()
+            # All phases done — mark the Install History record READY and
+            # persist the endpoint URLs so it renders like a normal install.
+            self._store_state("READY")
         except Exception as exc:
             self.state = "failed"
             self.error = str(exc)
             self._emit("error", message=str(exc))
             if self.current_phase:
                 self._phase_end(self.current_phase, ok=False)
+            self._store_state("FAILED", error=str(exc))
         finally:
             self._done = True
             self._emit("done", state=self.state)
@@ -285,6 +364,17 @@ class CustomStackJob:
             info=conn,
             pipeline_example=self.pipeline_example,
         )
+        # Persist endpoints to the Install History record (keep the custom_build
+        # marker so uninstall keeps using compose-down).
+        if self.store_install_id:
+            try:
+                store.set_outputs(self.store_install_id, {
+                    "custom_build": True,
+                    "urls": {label: {"url": url, "label": label} for label, url in conn.items()},
+                    "pipeline_example": self.pipeline_example,
+                })
+            except Exception:
+                pass
         self._emit("provision_complete", stack_name=self.stack_name)
         self._log("Stack is ready!")
         self.state = "done"

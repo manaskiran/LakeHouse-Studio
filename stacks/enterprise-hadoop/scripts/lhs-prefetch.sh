@@ -55,12 +55,24 @@ curl_robust() {
 # ── Apache Tez 0.10.4 ────────────────────────────────────────────────────────
 
 TEZ_TAR=jars/tez/apache-tez-0.10.4-bin.tar.gz
-TEZ_URL="https://archive.apache.org/dist/tez/0.10.4/apache-tez-0.10.4-bin.tar.gz"
+TEZ_MIRRORS=(
+  "https://dlcdn.apache.org/tez/0.10.4/apache-tez-0.10.4-bin.tar.gz"
+  "https://archive.apache.org/dist/tez/0.10.4/apache-tez-0.10.4-bin.tar.gz"
+)
 
 if [ ! -f "$TEZ_TAR" ]; then
   echo "[prefetch] downloading Apache Tez 0.10.4..."
   if ! cached_copy "$CACHE_DIR/tez/apache-tez-0.10.4-bin.tar.gz" "$TEZ_TAR"; then
-    curl -L --progress-bar "$TEZ_URL" -o "$TEZ_TAR"
+    downloaded=0
+    for mirror in "${TEZ_MIRRORS[@]}"; do
+      echo "[prefetch]   trying $mirror ..."
+      if curl_robust "$mirror" "$TEZ_TAR" 50000000; then
+        downloaded=1; break
+      fi
+      echo "[prefetch]   mirror failed, trying next..."
+      rm -f "$TEZ_TAR"
+    done
+    if [ "$downloaded" = "0" ]; then echo "[prefetch] ERROR: all Tez mirrors failed"; exit 1; fi
     save_to_cache "$TEZ_TAR" "$CACHE_DIR/tez/apache-tez-0.10.4-bin.tar.gz"
   fi
 fi

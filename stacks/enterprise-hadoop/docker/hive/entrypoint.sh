@@ -34,6 +34,13 @@ fi
 # ── Ensure hive home exists (beeline needs ~/.beeline for history) ───────────
 mkdir -p /home/hive/.beeline 2>/dev/null || true
 
+# ── Remove stale PID file so container restarts don't false-detect "already running" ──
+# Hive writes $$ (the bash PID, which is 1 in Docker) to hiveserver2.pid on start.
+# After a container restart the file persists; kill -0 1 always succeeds, so Hive
+# prints "HiveServer2 running as process 1. Stop it first." and exits in a crash loop.
+_PID_DIR="${HIVESERVER2_PID_DIR:-${HIVE_CONF_DIR:-/opt/hive/conf}}"
+rm -f "${_PID_DIR}/hiveserver2.pid" 2>/dev/null || true
+
 # ── Delegate to official Hive entrypoint ────────────────────────────────────
 # The official apache/hive image uses /entrypoint.sh
 exec /entrypoint.sh "$@"

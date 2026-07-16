@@ -89,8 +89,12 @@ def get_template_detail(template_id: str) -> dict[str, Any] | None:
         "cart": cart_ids,
         "pending": pending,
         "compliance": compliance_blocks,
-        # Installability: only pilot / ga templates expose Install. preview is gated.
-        "installable": tpl.get("readiness", "pilot") in {"pilot", "ga"},
+        # Installability: requires pilot/ga readiness AND a concrete stack_id.
+        # Templates whose recommended_set has no stack_id (e.g. Streaming Lakehouse,
+        # which references Kafka+Flink not yet packaged as a runnable stack) must not
+        # be installable — without a stack_id the frontend has nothing to install and
+        # would silently fall back to udp-local-v0.2.
+        "installable": tpl.get("readiness", "pilot") in {"pilot", "ga"} and bool(rs.get("stack_id")),
     }
 
 

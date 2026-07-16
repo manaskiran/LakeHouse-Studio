@@ -4,6 +4,13 @@
 # Run from the stack work directory (work/enterprise-hadoop).
 set -euo pipefail
 
+# Prevent Git Bash on Windows from converting /hdfs/paths into C:/hdfs/paths
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+
+# docker cp requires Windows-style host paths on Windows
+winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$STACK_DIR"
@@ -58,7 +65,19 @@ wait_ranger() {
 
 # ── 1. HDFS + YARN readiness ─────────────────────────────────────────────────
 
-wait_http "HDFS NameNode" "http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus"
+# HDFS NameNode HTTP port (9870) can be unreachable from the host after a Docker
+# Desktop restart on Windows (port-mapping glitch). Check from inside the container.
+echo "[bootstrap] waiting for HDFS NameNode..."
+for _i in $(seq 1 30); do
+  if docker exec ehd-namenode curl -sf \
+      "http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus" \
+      >/dev/null 2>&1; then
+    echo "  HDFS NameNode OK"; break
+  fi
+  if [ "$_i" = "30" ]; then echo "ERROR: HDFS NameNode did not start in time"; exit 1; fi
+  echo "  ($_i/30) HDFS NameNode not ready"; sleep 10
+done
+
 wait_http "YARN ResourceManager" "http://localhost:8088/ws/v1/cluster/info"
 
 # ── 2. HDFS directories ───────────────────────────────────────────────────────
@@ -103,7 +122,7 @@ fi
 
 if ! docker exec ehd-namenode hdfs dfs -test -e /apps/tez.tar.gz 2>/dev/null; then
   echo "  uploading tez.tar.gz to HDFS /apps/..."
-  docker cp "$TEZ_TAR" ehd-namenode:/tmp/tez.tar.gz
+  docker cp "$(winpath "$TEZ_TAR")" ehd-namenode:/tmp/tez.tar.gz
   docker exec ehd-namenode hdfs dfs -put /tmp/tez.tar.gz /apps/tez.tar.gz
   docker exec ehd-namenode hdfs dfs -chmod 755 /apps/tez.tar.gz
   echo "  Tez staged on HDFS"
@@ -154,8 +173,8 @@ docker exec ehd-starrocks-fe bash -c "
 
 echo "[bootstrap] running Spark demo Hudi bootstrap..."
 docker exec ehd-spark mkdir -p /tmp/spark-bootstrap
-docker cp "$HUDI_SPARK_JAR" ehd-spark:/tmp/spark-bootstrap/hudi-spark3.4-bundle_2.12-1.0.1.jar
-docker cp "$SCRIPT_DIR/../jobs/bootstrap_demo_hudi.py" ehd-spark:/tmp/spark-bootstrap/bootstrap_demo_hudi.py
+docker cp "$(winpath "$HUDI_SPARK_JAR")" ehd-spark:/tmp/spark-bootstrap/hudi-spark3.4-bundle_2.12-1.0.1.jar
+docker cp "$(winpath "$SCRIPT_DIR/../jobs/bootstrap_demo_hudi.py")" ehd-spark:/tmp/spark-bootstrap/bootstrap_demo_hudi.py
 docker exec ehd-spark /opt/spark/bin/spark-submit \
   --master local[2] \
   --jars /tmp/spark-bootstrap/hudi-spark3.4-bundle_2.12-1.0.1.jar \
@@ -163,7 +182,15 @@ docker exec ehd-spark /opt/spark/bin/spark-submit \
 
 # ── 10. Trino readiness ───────────────────────────────────────────────────────
 
-wait_http "Trino" "http://localhost:8080/v1/status"
+# Same Docker Desktop port-mapping caveat as HDFS — check from inside the container.
+echo "[bootstrap] waiting for Trino..."
+for _i in $(seq 1 30); do
+  if docker exec ehd-trino curl -sf "http://localhost:8080/v1/status" >/dev/null 2>&1; then
+    echo "  Trino OK"; break
+  fi
+  if [ "$_i" = "30" ]; then echo "ERROR: Trino did not start in time"; exit 1; fi
+  echo "  ($_i/30) Trino not ready"; sleep 10
+done
 
 # ── 11. Ranger Admin readiness + service registration ────────────────────────
 

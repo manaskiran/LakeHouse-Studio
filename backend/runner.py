@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import WORK_DIR
+from .etl_verify_job import ETL_VERIFY_SPARK_PY
 from .events import bus
 from .models import LogEvent, StepStatus
 from .notifications import notify
@@ -28,6 +30,25 @@ set -euo pipefail
 # into C:/Program Files/Git/home/... before passing them to docker exec.
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
+
+echo "[studio-bootstrap] waiting for MinIO..."
+for i in $(seq 1 60); do
+  if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+    echo "  minio OK"; break
+  fi
+  echo "  ($i/60) minio not ready yet"; sleep 5
+  if [ "$i" = "60" ]; then echo "minio never came up"; exit 1; fi
+done
+
+echo "[studio-bootstrap] ensuring datalake bucket exists..."
+docker start udp-create-bucket 2>/dev/null || true
+sleep 8
+NETWORK=$(docker inspect udp-minio --format "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}}{{end}}" 2>/dev/null | head -1)
+docker run --rm --network "${NETWORK:-udp_default}" --entrypoint sh \
+  minio/mc:RELEASE.2025-04-16T18-13-26Z \
+  -c "mc alias set udp http://minio:9000 admin udp_admin_12345 --api s3v4 && mc mb --ignore-existing udp/datalake" \
+  2>/dev/null || echo "  bucket ensure ran (idempotent)"
+echo "  datalake bucket ready"
 
 echo "[studio-bootstrap] waiting for Iceberg REST..."
 for i in $(seq 1 60); do
@@ -104,7 +125,121 @@ SELECT region, customer_count, total_order_amount, curated_timestamp
 FROM iceberg_rest_catalog.curated.demo_customer_summary;
 SQL
 
+# Superset is optional — the current UDP compose doesn't ship it, and the
+# `docker compose up` service list only starts what's in the cart. Only run
+# superset init when the container actually exists in this deployment.
+if docker ps -a --format '{{.Names}}' | grep -qx udp-superset; then
+  echo "[studio-bootstrap] waiting for Superset..."
+  for i in $(seq 1 40); do
+    if curl -fsS http://localhost:8088/health >/dev/null 2>&1; then
+      echo "  superset container up"; break
+    fi
+    echo "  ($i/40) superset not ready yet"; sleep 10
+    if [ "$i" = "40" ]; then echo "superset never came up"; exit 1; fi
+  done
+
+  echo "[studio-bootstrap] initializing Superset DB..."
+  docker exec udp-superset superset db upgrade
+  echo "[studio-bootstrap] creating Superset admin user..."
+  docker exec udp-superset superset fab create-admin \
+    --username admin --firstname Admin --lastname User \
+    --email admin@example.com --password admin 2>&1 | grep -v "already exist" || true
+  echo "[studio-bootstrap] loading Superset roles and permissions..."
+  docker exec udp-superset superset init
+  echo "  superset init done, waiting for webserver to stabilise..."
+  sleep 15
+  for i in $(seq 1 12); do
+    if curl -fsS http://localhost:8088/health >/dev/null 2>&1; then
+      echo "  superset ready: http://localhost:8088 (admin / admin)"; break
+    fi
+    sleep 5
+  done
+else
+  echo "[studio-bootstrap] superset not part of this deployment — skipping superset init"
+fi
+
 echo "[studio-bootstrap] complete"
+"""
+
+
+# ---------------------------------------------------------------------------
+# Shared multi-format ETL-verification block.
+#
+# Writes the format-adaptive PySpark job into udp-spark, runs it for whichever
+# table format(s) the user chose in the cart (substituted into __ETLV_FORMATS__
+# by the runner), then registers + queries the matching StarRocks external
+# catalog. Reused verbatim by BOTH the Spark smoke (_STUDIO_SMOKE_SH) and the
+# Trino smoke (_STUDIO_TRINO_SMOKE_SH) so every StarRocks+Spark+MinIO stack
+# (Local Demo, Startup Analytics, AI/ML, Fintech, udp-trino) proves all three
+# catalogs from a single source of truth.
+# ---------------------------------------------------------------------------
+_ETL_MULTIFORMAT_BLOCK = r"""# ---- 3-pipeline ETL verification (RDBMS / JSON / MongoDB) --------------------
+# Generates >=1000 rows per source in-process, stages the raw files to object
+# storage (visible in the console), ingests each into the CHOSEN table format
+# via Spark, and fails the smoke test unless all three tables hold >=1000 rows.
+#
+# Container names / endpoints / catalog names are stack-specific placeholders
+# (__SPARK_CTR__, __SR_CTR__, __S3_ENDPOINT__, ...) substituted by the runner
+# from _SMOKE_SUBST[stack.id]. Defaults (in _write_studio_bootstrap) reproduce
+# the udp-family values exactly, so Local Demo / Startup / AI-ML / Fintech /
+# udp-trino render byte-identical to before.
+echo "[studio-smoke] writing ETL-verify PySpark job into __SPARK_CTR__..."
+docker exec -i __SPARK_CTR__ bash -c 'mkdir -p __SPARK_JOBS__ && cat > __SPARK_JOBS__/lhs_etl_verify.py' <<'PYEOF'
+""" + ETL_VERIFY_SPARK_PY + r"""PYEOF
+
+echo "[studio-smoke] running ETL verification for the chosen table format(s): __ETLV_FORMATS__ ..."
+# The format(s) the user picked in the cart are substituted into __ETLV_FORMATS__
+# by the runner. Delta + Hudi + hadoop-aws are always added at submit time via
+# --packages so whichever format was chosen works on this one Spark image:
+# Iceberg lands via its REST catalog; Delta/Hudi land as HMS tables on storage.
+docker exec __SPARK_EXEC_ENV__ \
+  -e ETLV_FORMATS=__ETLV_FORMATS__ -e ETLV_CATALOG=__SPARK_ICE_CAT__ -e ETLV_DB=etl_verify \
+  -e ETLV_WAREHOUSE=__WAREHOUSE__ -e ETLV_HMS=__HMS_URI__ -e ETLV_ICE_URI=__ICE_URI__ -e ETLV_ICE_CATALOG_TYPE=__ICE_CAT_TYPE__ \
+  -e ETLV_S3_ENDPOINT=__S3_ENDPOINT__ -e ETLV_S3_KEY=__S3_KEY__ -e ETLV_S3_SECRET=__S3_SECRET__ \
+  __SPARK_CTR__ __SPARK_SUBMIT__ \
+  --packages __SPARK_PACKAGES__ \
+  __SPARK_JOBS__/lhs_etl_verify.py
+
+# ---- register + verify the StarRocks catalog for the CHOSEN table format ----
+# Iceberg already has __ICEBERG_SR_CAT__ (from bootstrap). Delta/Hudi land in
+# the Hive Metastore via the ETL (saveAsTable / hive_sync), so we register the
+# matching StarRocks external catalog AFTER the write (registering it before
+# would cache stale file listings). Non-fatal: the Spark ETL above is the
+# authoritative pass/fail; catalog registration is the "choose a catalog" layer.
+ETLV_FMT="__ETLV_FORMATS__"
+if echo "$ETLV_FMT" | grep -q iceberg; then
+  echo "[studio-smoke] verifying iceberg tables via StarRocks __ICEBERG_SR_CAT__..."
+  docker exec -i __SR_CTR__ mysql -h 127.0.0.1 -P 9030 -u root <<'SQL' || echo "  (iceberg cross-check skipped)"
+SET new_planner_optimize_timeout=30000;
+SELECT 'rdbms' p, COUNT(*) n FROM __ICEBERG_SR_CAT__.etl_verify.rdbms_iceberg
+UNION ALL SELECT 'json',  COUNT(*) FROM __ICEBERG_SR_CAT__.etl_verify.json_iceberg
+UNION ALL SELECT 'mongo', COUNT(*) FROM __ICEBERG_SR_CAT__.etl_verify.mongo_iceberg;
+SQL
+fi
+if echo "$ETLV_FMT" | grep -q hudi; then
+  echo "[studio-smoke] registering + querying StarRocks hudi_catalog..."
+  docker exec -i __SR_CTR__ mysql -h 127.0.0.1 -P 9030 -u root <<'SQL' || echo "  (hudi_catalog step skipped)"
+SET new_planner_optimize_timeout=30000;
+DROP CATALOG IF EXISTS hudi_catalog;
+CREATE EXTERNAL CATALOG hudi_catalog PROPERTIES ("type"="hudi","hive.metastore.uris"="__HMS_URI__"__SR_CAT_STORAGE_PROPS__);
+SHOW CATALOGS;
+SELECT 'rdbms' p, COUNT(*) n FROM hudi_catalog.etl_verify.rdbms_hudi
+UNION ALL SELECT 'json',  COUNT(*) FROM hudi_catalog.etl_verify.json_hudi
+UNION ALL SELECT 'mongo', COUNT(*) FROM hudi_catalog.etl_verify.mongo_hudi;
+SQL
+fi
+if echo "$ETLV_FMT" | grep -q delta; then
+  echo "[studio-smoke] registering StarRocks delta_catalog..."
+  docker exec -i __SR_CTR__ mysql -h 127.0.0.1 -P 9030 -u root <<'SQL' || echo "  (delta_catalog step skipped)"
+SET new_planner_optimize_timeout=30000;
+DROP CATALOG IF EXISTS delta_catalog;
+CREATE EXTERNAL CATALOG delta_catalog PROPERTIES ("type"="deltalake","hive.metastore.uris"="__HMS_URI__"__SR_CAT_STORAGE_PROPS__);
+SHOW CATALOGS;
+SELECT 'rdbms' p, COUNT(*) n FROM delta_catalog.etl_verify.rdbms_delta
+UNION ALL SELECT 'json',  COUNT(*) FROM delta_catalog.etl_verify.json_delta
+UNION ALL SELECT 'mongo', COUNT(*) FROM delta_catalog.etl_verify.mongo_delta;
+SQL
+fi
 """
 
 
@@ -131,9 +266,29 @@ echo "[studio-smoke] running Spark Iceberg smoke job..."
 docker exec udp-spark spark-submit //home/iceberg/jobs/smoke_test_iceberg.py
 
 echo "[studio-smoke] StarRocks queries..."
-docker exec udp-starrocks-fe mysql -h 127.0.0.1 -P 9030 -u root -e \
-  "SHOW CATALOGS; SHOW DATABASES; SELECT COUNT(*) AS customer_summary_rows FROM app_analytics.demo_customer_summary;"
+# The first query against the Iceberg REST external catalog is a cold read:
+# StarRocks fetches table metadata during planning and can blow the default
+# 3000ms new_planner_optimize_timeout. Raise it for the session and retry a
+# couple of times so a cold catalog doesn't flake the smoke.
+SR_SQL="SET new_planner_optimize_timeout=30000; SHOW CATALOGS; SHOW DATABASES; SELECT COUNT(*) AS customer_summary_rows FROM app_analytics.demo_customer_summary;"
+for _sr in 1 2 3; do
+  if docker exec udp-starrocks-fe mysql -h 127.0.0.1 -P 9030 -u root -e "$SR_SQL"; then
+    break
+  fi
+  [ "$_sr" = "3" ] && { echo "FAIL: StarRocks query after 3 attempts"; exit 1; }
+  echo "  StarRocks query attempt $_sr failed (cold catalog) — retrying in 5s..."
+  sleep 5
+done
 
+if docker ps --format '{{.Names}}' | grep -qx udp-superset; then
+  echo "[studio-smoke] checking Superset..."
+  curl -fsS http://localhost:8088/health >/dev/null || { echo "superset unreachable on :8088"; exit 1; }
+  echo "  superset OK"
+else
+  echo "[studio-smoke] superset not deployed — skipping check"
+fi
+
+""" + _ETL_MULTIFORMAT_BLOCK + r"""
 echo "[studio-smoke] passed"
 """
 
@@ -166,6 +321,25 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
+echo "[studio-trino-bootstrap] waiting for MinIO..."
+for i in $(seq 1 60); do
+  if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+    echo "  minio OK"; break
+  fi
+  echo "  ($i/60) minio not ready yet"; sleep 5
+  if [ "$i" = "60" ]; then echo "minio never came up"; exit 1; fi
+done
+
+echo "[studio-trino-bootstrap] ensuring datalake bucket exists..."
+docker start udp-create-bucket 2>/dev/null || true
+sleep 8
+NETWORK=$(docker inspect udp-minio --format "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}}{{end}}" 2>/dev/null | head -1)
+docker run --rm --network "${NETWORK:-udp_default}" --entrypoint sh \
+  minio/mc:RELEASE.2025-04-16T18-13-26Z \
+  -c "mc alias set udp http://minio:9000 admin udp_admin_12345 --api s3v4 && mc mb --ignore-existing udp/datalake" \
+  2>/dev/null || echo "  bucket ensure ran (idempotent)"
+echo "  datalake bucket ready"
+
 echo "[studio-trino-bootstrap] waiting for Iceberg REST..."
 for i in $(seq 1 60); do
   if curl -fsS http://localhost:8181/v1/config >/dev/null 2>&1; then
@@ -176,7 +350,7 @@ done
 
 echo "[studio-trino-bootstrap] waiting for Trino..."
 for i in $(seq 1 60); do
-  if curl -fsS http://localhost:8080/v1/info >/dev/null 2>&1; then
+  if docker exec udp-trino curl -fsS http://localhost:8080/v1/info >/dev/null 2>&1; then
     echo "  trino OK"; break
   fi
   echo "  ($i/60) trino not ready yet"; sleep 5
@@ -208,6 +382,27 @@ TRINOCAT
 docker exec udp-trino test -s /data/trino/etc/catalog/iceberg.properties \
   || { echo "iceberg.properties wrote empty — bootstrap aborted"; exit 1; }
 
+# --- OpenLineage: wire Trino to EMIT lineage into Marquez ---------------------
+# Only runs when the openlineage (Marquez) container is part of this stack
+# (e.g. Fintech Compliance) — no-op for plain Trino stacks. Trino 466+ ships a
+# built-in `openlineage` event listener; pointing it at Marquez's
+# /api/v1/lineage endpoint means every query the bootstrap + smoke run below
+# (CREATE TABLE AS SELECT, INSERT, the smoke SELECTs) is captured as a lineage
+# job + dataset graph you can browse in the Marquez UI (namespace: trino-demo).
+if docker ps --format '{{.Names}}' | grep -qx udp-openlineage; then
+  echo "[studio-trino-bootstrap] wiring Trino -> OpenLineage (Marquez)..."
+  docker exec -i udp-trino bash -c 'cat > /data/trino/etc/openlineage-event-listener.properties' <<'OLCFG'
+event-listener.name=openlineage
+openlineage-event-listener.transport.type=HTTP
+openlineage-event-listener.transport.url=http://udp-openlineage:5000
+openlineage-event-listener.transport.endpoint=/api/v1/lineage
+openlineage-event-listener.trino.uri=http://udp-trino:8080
+openlineage-event-listener.namespace=trino-demo
+OLCFG
+  docker exec udp-trino bash -c 'grep -q openlineage-event-listener /data/trino/etc/config.properties 2>/dev/null || echo "event-listener.config-files=/data/trino/etc/openlineage-event-listener.properties" >> /data/trino/etc/config.properties'
+  echo "  Trino OpenLineage event listener configured (namespace: trino-demo)"
+fi
+
 echo "[studio-trino-bootstrap] restarting Trino to load iceberg catalog..."
 # NOTE: `docker compose restart trino` would fail here because the bootstrap
 # script runs without the `-f docker-compose.fragment.yml` flag, so compose
@@ -216,12 +411,26 @@ echo "[studio-trino-bootstrap] restarting Trino to load iceberg catalog..."
 docker restart udp-trino
 
 echo "[studio-trino-bootstrap] waiting for Trino after restart..."
-for i in $(seq 1 60); do
-  if curl -fsS http://localhost:8080/v1/info >/dev/null 2>&1; then
-    echo "  trino back up"; break
+TRINO_BACK=no
+for i in $(seq 1 24); do
+  if docker exec udp-trino curl -fsS http://localhost:8080/v1/info >/dev/null 2>&1; then
+    echo "  trino back up"; TRINO_BACK=yes; break
   fi
-  echo "  ($i/60) trino not ready yet"; sleep 5
+  echo "  ($i/24) trino not ready yet"; sleep 5
 done
+# Safety net: if Trino did NOT come back and we added the OpenLineage listener,
+# a bad listener config is the most likely cause — strip it and restart so the
+# install never bricks on lineage wiring (worst case: no lineage, working Trino).
+if [ "$TRINO_BACK" = "no" ] && docker exec udp-trino test -f /data/trino/etc/openlineage-event-listener.properties 2>/dev/null; then
+  echo "  Trino didn't return — removing OpenLineage listener and restarting (lineage disabled, stack still works)"
+  docker exec udp-trino rm -f /data/trino/etc/openlineage-event-listener.properties
+  docker exec udp-trino bash -c "sed -i '/openlineage-event-listener/d' /data/trino/etc/config.properties"
+  docker restart udp-trino
+  for i in $(seq 1 24); do
+    docker exec udp-trino curl -fsS http://localhost:8080/v1/info >/dev/null 2>&1 && { echo "  trino back up (without lineage)"; break; }
+    echo "  ($i/24) trino not ready yet"; sleep 5
+  done
+fi
 
 echo "[studio-trino-bootstrap] verifying iceberg catalog is registered..."
 for i in $(seq 1 12); do
@@ -332,7 +541,7 @@ curl -fsS http://localhost:8181/v1/config >/dev/null || { echo "iceberg-rest unr
 echo "  iceberg-rest OK"
 
 echo "[studio-trino-smoke] checking Trino..."
-curl -fsS http://localhost:8080/v1/info >/dev/null || { echo "trino unreachable"; exit 1; }
+docker exec udp-trino curl -fsS http://localhost:8080/v1/info >/dev/null || { echo "trino unreachable"; exit 1; }
 echo "  trino OK"
 
 echo "[studio-trino-smoke] checking StarRocks FE..."
@@ -347,6 +556,7 @@ echo "[studio-trino-smoke] StarRocks queries (same Iceberg catalog)..."
 docker exec udp-starrocks-fe mysql -h 127.0.0.1 -P 9030 -u root -e \
   "SHOW CATALOGS; SHOW DATABASES; SELECT COUNT(*) AS customer_summary_rows FROM app_analytics.demo_customer_summary;"
 
+""" + _ETL_MULTIFORMAT_BLOCK + r"""
 echo "[studio-trino-smoke] passed"
 """
 
@@ -359,7 +569,25 @@ _STUDIO_SCRIPT_SETS: dict[str, tuple[tuple[str, str], tuple[str, str]]] = {
         ("lhs-bootstrap.sh", _STUDIO_BOOTSTRAP_SH),
         ("lhs-smoke.sh",     _STUDIO_SMOKE_SH),
     ),
+    # Startup Analytics = udp-local-v0.2 core + Superset (from the compose
+    # fragment). Same REST-catalog bootstrap; its Superset init block runs
+    # because the udp-superset container exists for this stack.
+    "startup-analytics-local-v0.1": (
+        ("lhs-bootstrap.sh", _STUDIO_BOOTSTRAP_SH),
+        ("lhs-smoke.sh",     _STUDIO_SMOKE_SH),
+    ),
     "udp-trino-local-v0.1": (
+        ("lhs-trino-bootstrap.sh", _STUDIO_TRINO_BOOTSTRAP_SH),
+        ("lhs-trino-smoke.sh",     _STUDIO_TRINO_SMOKE_SH),
+    ),
+    # AI/ML Research = udp-trino runtime + Spark (declared) + JupyterLab.
+    # Reuses the Trino bootstrap/smoke; Spark + Jupyter read the same
+    # Iceberg-REST warehouse the Trino bootstrap seeds.
+    "ai-ml-research-local-v0.1": (
+        ("lhs-trino-bootstrap.sh", _STUDIO_TRINO_BOOTSTRAP_SH),
+        ("lhs-trino-smoke.sh",     _STUDIO_TRINO_SMOKE_SH),
+    ),
+    "fintech-compliance-local-v0.1": (
         ("lhs-trino-bootstrap.sh", _STUDIO_TRINO_BOOTSTRAP_SH),
         ("lhs-trino-smoke.sh",     _STUDIO_TRINO_SMOKE_SH),
     ),
@@ -376,6 +604,120 @@ except ImportError:
     # Module is optional; if absent, the v0.6 candidate stacks fall back
     # to whatever the manifest's commands.bootstrap/smoke argv points at.
     pass
+
+
+# Per-stack substitution values for the shared _ETL_MULTIFORMAT_BLOCK. The
+# DEFAULT reproduces the udp-family values exactly (container names, MinIO
+# endpoint/creds, Spark iceberg catalog `udp`, StarRocks iceberg catalog
+# `iceberg_rest_catalog`) so Local Demo / Startup / AI-ML / Fintech / udp-trino
+# render byte-identical to the pre-parameterization block. Stacks with a
+# different shape (different container prefix, MinIO creds, warehouse bucket)
+# override only the keys that differ.
+_SMOKE_SUBST_DEFAULT: dict[str, str] = {
+    # NOTE: __SR_CAT_STORAGE_PROPS__ must be FIRST — its value embeds __S3_*__
+    # placeholders that the later entries resolve (substitution is order-sensitive).
+    # S3/MinIO stacks append the aws.s3.* block; HDFS stacks override it to "".
+    "__SR_CAT_STORAGE_PROPS__": (
+        ',"aws.s3.endpoint"="__S3_ENDPOINT__","aws.s3.enable_ssl"="false",'
+        '"aws.s3.enable_path_style_access"="true","aws.s3.access_key"="__S3_KEY__",'
+        '"aws.s3.secret_key"="__S3_SECRET__","aws.s3.region"="us-east-1"'
+    ),
+    "__SPARK_CTR__":      "udp-spark",
+    "__SR_CTR__":         "udp-starrocks-fe",
+    "__SPARK_JOBS__":     "//home/iceberg/jobs",
+    "__SPARK_ICE_CAT__":  "udp",
+    "__WAREHOUSE__":      "s3a://datalake/warehouse",
+    "__S3_ENDPOINT__":    "http://minio:9000",
+    "__S3_KEY__":         "admin",
+    "__S3_SECRET__":      "udp_admin_12345",
+    "__HMS_URI__":        "thrift://hive-metastore:9083",
+    "__ICEBERG_SR_CAT__": "iceberg_rest_catalog",
+    # spark-submit is on PATH in the tabulario image (udp-family). HDFS stacks on
+    # apache/spark override with the absolute path (/opt/spark/bin/spark-submit).
+    "__SPARK_SUBMIT__":   "spark-submit",
+    # Extra `docker exec` flags before the container name. Empty for udp
+    # (tabulario has a writable HOME/.ivy2). apache/spark needs HOME=/tmp so
+    # Ivy (--packages resolution) has a writable cache.
+    "__SPARK_EXEC_ENV__": "",
+    # Empty = rely on the container's pre-baked iceberg catalog (udp-family).
+    "__ICE_URI__":        "",
+    # Iceberg catalog type for the ETL job: "rest" (default) or "hive" (HDFS
+    # stacks reuse their Hive Metastore as the iceberg catalog).
+    "__ICE_CAT_TYPE__":   "rest",
+    # Spark --packages for the ETL. Default = Spark 3.5 (tabulario image). HDFS
+    # stacks on apache/spark 3.4 override with the 3.4-compatible bundle set.
+    "__SPARK_PACKAGES__": (
+        "io.delta:delta-spark_2.12:3.2.1,"
+        "org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,"
+        "org.apache.hadoop:hadoop-aws:3.3.4"
+    ),
+}
+_SMOKE_SUBST: dict[str, dict[str, str]] = {
+    # Streaming Lakehouse — same architecture as udp (tabulario Spark image +
+    # StarRocks FE + MinIO + Iceberg REST) but every service uses the `sl-`
+    # container prefix, MinIO secret `streaming123`, Spark iceberg catalog `rest`
+    # and warehouse bucket `streaming-lake`. HMS is added additively to the
+    # stack's own compose; the Kafka/Flink build is untouched.
+    "streaming-local-v1.0": {
+        "__SPARK_CTR__":     "sl-spark",
+        "__SR_CTR__":        "sl-starrocks-fe",
+        "__SPARK_ICE_CAT__": "rest",
+        "__WAREHOUSE__":     "s3a://streaming-lake/warehouse",
+        "__S3_ENDPOINT__":   "http://sl-minio:9000",
+        "__S3_SECRET__":     "streaming123",
+        "__ICEBERG_SR_CAT__": "iceberg_rest_catalog",
+        # sl-spark has no udp-patched spark-defaults; point iceberg at the
+        # stack's own REST catalog so the iceberg pipeline works too.
+        "__ICE_URI__":       "http://sl-iceberg-rest:8181",
+    },
+    # Production Lakehouse — udp-family container names + MinIO(datalake) so most
+    # keys are the DEFAULT. Only differs in: no baked Spark catalog (added Spark
+    # points at Nessie's iceberg REST endpoint), and StarRocks' iceberg catalog
+    # is `iceberg_nessie_catalog` (registered by the Nessie bootstrap).
+    "iceberg-nessie-trino-local-v0.1": {
+        "__SPARK_ICE_CAT__":  "nessie",
+        "__ICE_URI__":        "http://nessie:19120/iceberg/main",
+        "__ICEBERG_SR_CAT__": "iceberg_nessie_catalog",
+    },
+    # Enterprise / Healthcare (enterprise-hadoop-v1.0) — HDFS-NATIVE, no MinIO.
+    # Reuses the stack's OWN Postgres-backed Hive Metastore + apache/spark 3.4;
+    # data lands on HDFS. iceberg via a Hive catalog (no REST); Delta/Hudi in the
+    # existing HMS. StarRocks catalog props carry NO aws.s3.* (HDFS via HMS).
+    # NOTE: not yet live-verified — this box can't run the 20GB HDFS build;
+    # proven on a real 20GB+ target via SSH install.
+    "enterprise-hadoop-v1.0": {
+        "__SPARK_CTR__":          "ehd-spark",
+        "__SR_CTR__":             "ehd-starrocks-fe",
+        "__SPARK_SUBMIT__":       "/opt/spark/bin/spark-submit",
+        "__SPARK_EXEC_ENV__":     "-e HOME=/tmp",
+        "__SPARK_JOBS__":         "/tmp",
+        "__SPARK_ICE_CAT__":      "ice",
+        "__WAREHOUSE__":          "hdfs://namenode:9820/tmp/hive/warehouse",
+        "__S3_ENDPOINT__":        "",
+        "__S3_KEY__":             "",
+        "__S3_SECRET__":          "",
+        "__ICE_URI__":            "",
+        "__ICE_CAT_TYPE__":       "hive",
+        "__ICEBERG_SR_CAT__":     "iceberg_hive_catalog",
+        "__SR_CAT_STORAGE_PROPS__": "",
+        "__SPARK_PACKAGES__": (
+            "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.5.2,"
+            "io.delta:delta-spark_2.12:2.4.0,"
+            "org.apache.hudi:hudi-spark3.4-bundle_2.12:0.15.0"
+        ),
+    },
+}
+
+# Stacks that own their bootstrap/smoke scripts (not generated from
+# _STUDIO_SCRIPT_SETS) but should still get the additive 3-catalog feature: the
+# runner drops a standalone `lhs-etl-verify.sh` (the shared ETL block, values
+# substituted) into scripts/, and the stack's own smoke calls it at the end.
+# Keeps the ETL PySpark job DRY (single source: etl_verify_job.py).
+_ETL_FEATURE_STACKS: set[str] = {
+    "streaming-local-v1.0",
+    "iceberg-nessie-trino-local-v0.1",
+    "enterprise-hadoop-v1.0",
+}
 
 
 def _build_steps(stack: StackManifest) -> list[StepStatus]:
@@ -396,13 +738,63 @@ def _build_steps(stack: StackManifest) -> list[StepStatus]:
     ]
 
 
+def _iter_bash_candidates() -> list[str]:
+    """Every `bash` on PATH, in PATH order, plus well-known Git-for-Windows
+    install locations that may not be on PATH.
+
+    On Windows, `C:\\Windows\\System32\\bash.exe` is the WSL launcher shim.
+    It frequently resolves ahead of Git Bash in a process's PATH (e.g. when
+    spawned from PowerShell), and fails outright on any machine where WSL
+    is present but has no Linux distro installed — even though a perfectly
+    good Git Bash is installed and on PATH. shutil.which() alone can't tell
+    the difference, so every candidate must actually be invoked and
+    verified (see _bash_executable below) rather than trusting the first
+    PATH match."""
+    seen: set[str] = set()
+    candidates: list[str] = []
+    names = ("bash.exe", "bash") if platform.system() == "Windows" else ("bash",)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        for name in names:
+            p = Path(d) / name
+            if p.is_file():
+                key = str(p).lower()
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(str(p))
+    if platform.system() == "Windows":
+        for extra in (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ):
+            key = extra.lower()
+            if key not in seen and Path(extra).is_file():
+                seen.add(key)
+                candidates.append(extra)
+    return candidates
+
+
 def _bash_executable() -> str:
-    bash = shutil.which("bash")
-    if not bash:
+    candidates = _iter_bash_candidates()
+    if not candidates:
         raise RuntimeError(
             "bash not found in PATH. Install Git Bash (Windows) or any POSIX bash."
         )
-    return bash
+    for c in candidates:
+        try:
+            r = subprocess.run([c, "--version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return c
+        except Exception:
+            continue
+    raise RuntimeError(
+        "bash was found on PATH but every candidate failed to run "
+        f"({', '.join(candidates)}). On Windows this is usually the WSL "
+        "launcher shim at System32\\bash.exe shadowing Git Bash — install "
+        "Git for Windows or remove/reorder the broken WSL entry."
+    )
 
 
 def _to_posix_path(p: Path) -> str:
@@ -465,6 +857,75 @@ def _build_subprocess_env() -> dict[str, str]:
     return out
 
 
+def _force_remove_tree(path: Path) -> None:
+    r"""Remove a directory tree robustly, defeating Windows edge cases.
+
+    shutil.rmtree — and even `rd /s /q` — choke on artifacts that Airflow /
+    Docker routinely leave under an install dir:
+      * reparse points / symlinks (e.g. scheduler/logs/latest)
+      * reserved device-name files (a literal `nul`, `con`, `aux` — created by
+        a shell redirect that hit a non-device context). These cannot even be
+        opened or deleted through normal Win32 path parsing.
+    robocopy mirroring an EMPTY directory into the target reliably empties even
+    those, because robocopy uses the \\?\ extended-length path API internally.
+    We then remove the emptied husk. Raises with a clear message if the tree
+    still can't be removed (so the clone step fails loudly, not cryptically).
+    """
+    try:
+        shutil.rmtree(path)
+        return
+    except OSError:
+        if sys.platform != "win32":
+            # Linux/macOS: a container running as root can write into a
+            # bind-mounted install dir (e.g. enterprise-hadoop's prefetch drops
+            # Hudi/Spark jars into ./jars as root), leaving files the Studio
+            # user can't delete -> PermissionError on the NEXT install's clone.
+            # Delete the tree via a throwaway root container that bind-mounts
+            # the PARENT: docker runs as root, so it can remove anything. No
+            # passwordless sudo required.
+            try:
+                parent = path.parent
+                subprocess.run(
+                    ["docker", "run", "--rm", "-v", f"{parent}:/w",
+                     "alpine", "sh", "-c", f"rm -rf /w/{shlex.quote(path.name)}"],
+                    capture_output=True, timeout=180,
+                )
+            except Exception:
+                pass
+            if path.exists():
+                raise RuntimeError(
+                    f"could not remove existing install dir {path}: it contains "
+                    f"root-owned files (a container wrote into a bind mount as "
+                    f"root) and the docker-based cleanup failed. Remove it "
+                    f"manually with `sudo rm -rf {path}`, then retry."
+                )
+            return
+    # Windows fallback: robocopy /MIR from an empty dir, then rmdir the husk.
+    import tempfile as _tf
+    empty = Path(_tf.mkdtemp(prefix="lhs-empty-"))
+    try:
+        # robocopy exit codes 0-7 are success/informational — do NOT check=True.
+        subprocess.run(
+            ["robocopy", str(empty), str(path), "/MIR",
+             "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/NP"],
+            capture_output=True,
+        )
+        subprocess.run(["cmd", "/c", "rd", "/s", "/q", str(path)],
+                       capture_output=True)
+    finally:
+        try:
+            os.rmdir(empty)
+        except OSError:
+            pass
+    if path.exists():
+        raise RuntimeError(
+            f"could not remove existing install dir {path}: a locked file or "
+            f"Windows reserved-name artifact (e.g. 'nul') remains. Stop any "
+            f"container/process using it, or delete the folder manually, then "
+            f"retry."
+        )
+
+
 class UDPRunner:
     def __init__(self, stack: StackManifest, install_id: str, host: str, install_dir: Path):
         self.stack = stack
@@ -521,12 +982,18 @@ class UDPRunner:
 
         env = _build_subprocess_env()
 
-        proc = await asyncio.create_subprocess_exec(
-            bash, "-c", cmd_str,  # no -l: don't source user profile
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                bash, "-c", cmd_str,  # no -l: don't source user profile
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except NotImplementedError:
+            # Windows SelectorEventLoop (set by uvicorn --reload) does not support
+            # asyncio subprocesses. Fall back to blocking subprocess in a thread.
+            return await self._run_bash_threaded(step_id, bash, cmd_str, env, timeout)
+
         self._proc = proc
 
         async def _drain(stream: asyncio.StreamReader, kind: str) -> None:
@@ -577,6 +1044,79 @@ class UDPRunner:
         rc = proc.returncode
         return rc if rc is not None else 1
 
+    async def _run_bash_threaded(
+        self, step_id: str, bash: str, cmd_str: str, env: dict, timeout: int
+    ) -> int:
+        """Thread-based subprocess fallback for Windows SelectorEventLoop."""
+        import subprocess as _sp
+        import threading as _th
+        import queue as _q
+
+        loop = asyncio.get_event_loop()
+        done_q: _q.Queue = _q.Queue()
+        proc_box: list = [None]
+
+        def _log_safe(stream: str, line: str) -> None:
+            loop.call_soon_threadsafe(self._log, step_id, stream, line)
+
+        def _run() -> None:
+            try:
+                p = _sp.Popen(
+                    [bash, "-c", cmd_str],
+                    stdout=_sp.PIPE, stderr=_sp.PIPE,
+                    env=env,
+                )
+                proc_box[0] = p
+                self._proc = p  # type: ignore[assignment]  # enables cancel()
+
+                def _drain(pipe, kind: str) -> None:
+                    for raw in pipe:
+                        try:
+                            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        except Exception:
+                            line = repr(raw)
+                        _log_safe(kind, line)
+
+                t_out = _th.Thread(target=_drain, args=(p.stdout, "stdout"), daemon=True)
+                t_err = _th.Thread(target=_drain, args=(p.stderr, "stderr"), daemon=True)
+                t_out.start(); t_err.start()
+                t_out.join(); t_err.join()
+                p.wait()
+                done_q.put(p.returncode if p.returncode is not None else 1)
+            except Exception as exc:
+                _log_safe("stderr", f"[subprocess error: {exc}]")
+                done_q.put(1)
+
+        _th.Thread(target=_run, daemon=True).start()
+
+        deadline = loop.time() + timeout
+        while True:
+            if self._cancel:
+                p = proc_box[0]
+                if p:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                return 1
+            try:
+                rc = done_q.get_nowait()
+                if self._proc is proc_box[0]:
+                    self._proc = None
+                return rc
+            except _q.Empty:
+                pass
+            if loop.time() > deadline:
+                self._log(step_id, "stderr", f"[timeout after {timeout}s; killing]")
+                p = proc_box[0]
+                if p:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                return 124
+            await asyncio.sleep(0.25)
+
     @staticmethod
     def _sh_quote(s: str) -> str:
         if not s or any(c in s for c in " \t\"'\\$`!|&;()<>*?[]{}"):
@@ -621,7 +1161,10 @@ class UDPRunner:
                 return False
             self.install_dir.parent.mkdir(parents=True, exist_ok=True)
             if self.install_dir.exists():
-                _shutil.rmtree(self.install_dir)
+                # Robustly remove the prior workspace. Handles reparse points
+                # (Airflow scheduler/logs/latest) AND Windows reserved-name
+                # files (a literal `nul`) that defeat both rmtree and rd /s /q.
+                _force_remove_tree(self.install_dir)
             _shutil.copytree(str(src_path), str(self.install_dir))
             self._step_end("clone", True, exit_code=0)
             return True
@@ -793,6 +1336,21 @@ class UDPRunner:
             text,
         )
 
+        # Windows-only: remap Spark's app-UI host port 4040 -> 18040. On
+        # Windows, Hyper-V/WinNAT commonly reserves a large dynamic port block
+        # (observed 3897-4602) that swallows 4040, so `docker compose up` dies
+        # with "bind: An attempt was made to access a socket in a way forbidden
+        # by its access permissions". 4040 is only the transient Spark job UI;
+        # nothing in Studio's outputs or doctor references it, so bumping the
+        # HOST side out of the reserved range is safe. Container stays 4040.
+        spark_4040_remapped = 0
+        if platform.system() == "Windows":
+            text, spark_4040_remapped = re.subn(
+                r'(-\s*")4040:4040(")',
+                r'\g<1>18040:4040\g<2>',
+                text,
+            )
+
         if text != original:
             compose_path.write_text(text, encoding="utf-8")
             for repo, image in image_replacements:
@@ -807,6 +1365,10 @@ class UDPRunner:
             if healthy_to_started:
                 self._log("env", "stdout",
                           f"compose: downgraded {healthy_to_started} 'service_healthy' deps to 'service_started' (UDP upstream healthchecks unreliable; bootstrap step has its own readiness gate)")
+            if spark_4040_remapped:
+                self._log("env", "stdout",
+                          "compose: remapped Spark UI host port 4040 -> 18040 "
+                          "(4040 falls in the Windows Hyper-V reserved port range)")
 
     def _patch_spark_defaults(self) -> None:
         """Repoint Spark's default `udp` catalog from hive-metastore to
@@ -959,21 +1521,84 @@ class UDPRunner:
         and `commands.smoke` argv reference. Unknown stack ids skip the
         write silently; the manifest may run UDP's native scripts instead.
         """
+        # Derive the table format(s) the user picked in the cart so the smoke's
+        # ETL verification runs THAT format (iceberg/delta/hudi). The base stack
+        # is the same regardless; only the format written/verified changes. The
+        # runner substitutes __ETLV_FORMATS__ in the smoke body.
+        etlv_formats = self._chosen_table_formats()
+
+        # Stack-specific container names / endpoints for the shared ETL block.
+        # DEFAULT = udp-family values (byte-identical to before); a stack in
+        # _SMOKE_SUBST overrides only what differs.
+        subst = dict(_SMOKE_SUBST_DEFAULT)
+        subst.update(_SMOKE_SUBST.get(self.stack.id, {}))
+
+        def _apply_subst(body: str) -> str:
+            body = body.replace("__ETLV_FORMATS__", etlv_formats)
+            for ph, val in subst.items():
+                body = body.replace(ph, val)
+            return body
+
+        scripts_dir = self.install_dir / "scripts"
+
+        # Additive 3-catalog feature for stacks that own their bootstrap/smoke
+        # (e.g. Streaming): drop a standalone lhs-etl-verify.sh that their smoke
+        # calls at the end. Runs even when the stack has no _STUDIO_SCRIPT_SETS
+        # entry, so the Kafka/Flink build is left completely untouched.
+        if self.stack.id in _ETL_FEATURE_STACKS:
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            etl_sh = (
+                "#!/usr/bin/env bash\n"
+                "# Studio-generated: additive 3-catalog (iceberg/hudi/delta) verification.\n"
+                "# Source of truth: backend/etl_verify_job.py + _ETL_MULTIFORMAT_BLOCK.\n"
+                "set -eo pipefail\n"
+                "export MSYS_NO_PATHCONV=1\n"
+                "export MSYS2_ARG_CONV_EXCL='*'\n\n"
+                + _apply_subst(_ETL_MULTIFORMAT_BLOCK)
+                + '\necho "[studio-etl-verify] done"\n'
+            )
+            p = scripts_dir / "lhs-etl-verify.sh"
+            p.write_text(etl_sh, encoding="utf-8")
+            try:
+                p.chmod(0o755)
+            except Exception:
+                pass
+
         script_set = _STUDIO_SCRIPT_SETS.get(self.stack.id)
         if script_set is None:
-            self._log("env", "stdout",
-                      f"no studio script set for stack '{self.stack.id}' — "
-                      "falling back to whatever the manifest points at")
+            if self.stack.id not in _ETL_FEATURE_STACKS:
+                self._log("env", "stdout",
+                          f"no studio script set for stack '{self.stack.id}' — "
+                          "falling back to whatever the manifest points at")
             return
-        scripts_dir = self.install_dir / "scripts"
+
         scripts_dir.mkdir(parents=True, exist_ok=True)
         for name, body in script_set:
+            body = _apply_subst(body)
             path = scripts_dir / name
             path.write_text(body, encoding="utf-8")
             try:
                 path.chmod(0o755)
             except Exception:
                 pass
+
+    def _chosen_table_formats(self) -> str:
+        """Table format(s) from the install's cart → ETLV_FORMATS value.
+        Defaults to 'iceberg' when the cart has no explicit format (the base
+        stack is Iceberg-oriented). Multiple picks are preserved, comma-joined."""
+        try:
+            rec = store.get(self.install_id)
+            cart = list((rec.cart if rec else []) or [])
+        except Exception:
+            cart = []
+        picked = []
+        if "iceberg" in cart:
+            picked.append("iceberg")
+        if "delta" in cart or "spark-delta" in cart:
+            picked.append("delta")
+        if "hudi" in cart or "hudi-v1" in cart:
+            picked.append("hudi")
+        return ",".join(picked) if picked else "iceberg"
 
     async def _step_env(self, overrides: dict[str, str]) -> bool:
         self._step_start("env")
@@ -1006,6 +1631,23 @@ class UDPRunner:
         # optional UDP services we don't ship (hms/ranger) — silences
         # docker-compose's "variable not set" warnings on every command.
         merged: dict[str, str] = {**self._SAFE_DEFAULTS, **self.stack.env_defaults, **clean_overrides}
+
+        # Name the compose default network with a HYPHEN (not the default
+        # `<project>_default` underscore). A container's reverse-DNS PTR is
+        # `<container>.<network>`; an underscore there is an illegal URI hostname
+        # char and breaks HMS self-resolution -> StarRocks getAllDatabases for
+        # the Delta/Hudi catalogs. Install-specific so side-by-side installs
+        # don't share a network. Fragments reference this via ${LHS_NET}.
+        merged.setdefault("LHS_NET", f"{self.install_dir.name.replace('_', '-')}-net")
+
+        # Auto-generate Airflow secrets if not already in merged/overrides.
+        # Airflow refuses to start with blank FERNET_KEY or SECRET_KEY.
+        if "AIRFLOW_FERNET_KEY" not in merged or not merged["AIRFLOW_FERNET_KEY"]:
+            import base64 as _b64, os as _os
+            merged["AIRFLOW_FERNET_KEY"] = _b64.urlsafe_b64encode(_os.urandom(32)).decode()
+        if "AIRFLOW_WEBSERVER_SECRET_KEY" not in merged or not merged["AIRFLOW_WEBSERVER_SECRET_KEY"]:
+            import secrets as _sec
+            merged["AIRFLOW_WEBSERVER_SECRET_KEY"] = _sec.token_hex(32)
 
         # Patch Spark's catalog config: swap the default `udp` catalog from
         # hive-metastore-backed to iceberg-REST-backed so the Spark bootstrap
@@ -1079,6 +1721,55 @@ class UDPRunner:
             self._step_end("env", False, message=str(e))
             return False
 
+    def _reconstruct_overlays_from_disk(self) -> None:
+        """Rebuild self._overlays from compose files a PRIOR env step wrote.
+
+        Used by the docker_compose_up branch when self._overlays is empty —
+        which happens on Retry/Skip because those restart the pipeline after
+        the env step, so the in-memory overlay list is never populated in the
+        new runner instance. The files themselves persist in install_dir, so
+        we rediscover them here and re-attach their `-f` flags + services.
+
+        The per-stack REQUIRED fragment goes FIRST (front-inserted) so its
+        services come up before any opt-in overlay that might depend on them,
+        matching _write_stack_fragment's ordering.
+        """
+        # Per-stack required fragment (nessie / hms / delta / polaris / trino /
+        # superset / trino+jupyter). Front of the list.
+        try:
+            from .stack_compose_fragments import FRAGMENT_FILENAME, FRAGMENT_SERVICES
+            frag = self.install_dir / FRAGMENT_FILENAME
+            if frag.exists():
+                self._overlays.insert(0, {
+                    "name": f"{self.stack.id}-fragment",
+                    "file": frag,
+                    "services": list(FRAGMENT_SERVICES.get(self.stack.id, []) or []),
+                })
+                self._log("start", "stdout",
+                          f"recovered stack fragment from disk: {frag.name} "
+                          "(env step didn't re-run — likely a retry)")
+        except ImportError:
+            pass
+        # Opt-in overlays (airflow / dagster / superset / observability). A file
+        # only exists on disk if its LHS_*_ENABLED flag was on at env time, so
+        # re-including it here preserves the operator's original choice.
+        try:
+            from . import airflow_overlay, dagster_overlay, superset_overlay, observability_overlay
+            for mod in (airflow_overlay, dagster_overlay, superset_overlay, observability_overlay):
+                fname = getattr(mod, "OVERLAY_FILENAME", None)
+                if not fname:
+                    continue
+                f = self.install_dir / fname
+                if f.exists():
+                    name = mod.__name__.rsplit(".", 1)[-1].replace("_overlay", "")
+                    self._overlays.append({
+                        "name": name,
+                        "file": f,
+                        "services": list(getattr(mod, "SERVICES", []) or []),
+                    })
+        except ImportError:
+            pass
+
     async def _step_cmd(self, step_id: str, cmd_name: str) -> bool:
         self._step_start(step_id)
         try:
@@ -1100,11 +1791,22 @@ class UDPRunner:
             if not services:
                 self._step_end(step_id, False, message="no services to start (cart empty?)")
                 return False
+            # Retry/Skip self-heal: those paths restart the pipeline at a
+            # LATER step, so `_step_env` (which populates self._overlays)
+            # never ran in THIS runner instance — leaving self._overlays
+            # empty even though the fragment / overlay compose files are
+            # already on disk from the original env step. Without them the
+            # `-f <fragment>.yml` flag is omitted and docker compose fails
+            # with `no such service: <fragment-service>` (e.g. trino/nessie).
+            # Rebuild from disk so `start` is idempotent across retries.
+            if not self._overlays:
+                self._reconstruct_overlays_from_disk()
+
             # v0.6.1 — inject opt-in overlay compose files via `-f` and
             # extend the explicit service list with the overlay's services.
-            # When _overlays is empty (default — no LHS_*_ENABLED flags),
-            # this is a no-op and the argv matches the pre-v0.6.1 shape
-            # exactly. Order: `docker compose -f base -f overlay up -d ...`
+            # When _overlays is empty (default — no LHS_*_ENABLED flags and
+            # no per-stack fragment), this is a no-op and the argv matches
+            # the pre-v0.6.1 shape exactly. Order: `-f base -f overlay up -d`.
             argv = ["docker", "compose"]
             if self._overlays:
                 # The base compose file is the default discovery target;
@@ -1274,7 +1976,8 @@ class UDPRunner:
         except asyncio.CancelledError:
             self._fail("cancelled")
         except Exception as e:
-            self._fail(f"unexpected: {e}")
+            import traceback as _tb
+            self._fail(f"unexpected: {type(e).__name__}: {e} | {_tb.format_exc()}")
 
     def _fail(self, msg: str) -> None:
         store.update_state(self.install_id, "FAILED", error=msg)
@@ -1476,7 +2179,8 @@ class RemoteClusterRunner:
         except asyncio.CancelledError:
             self._fail("cancelled")
         except Exception as e:
-            self._fail(f"unexpected: {e}")
+            import traceback as _tb
+            self._fail(f"unexpected: {type(e).__name__}: {e} | {_tb.format_exc()}")
 
     async def cancel(self) -> None:
         self._cancel = True

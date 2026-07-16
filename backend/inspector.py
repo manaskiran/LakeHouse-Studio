@@ -210,16 +210,34 @@ def _check_disk(min_gb: float, path: str = "/") -> InspectionCheck:
 
 
 def _check_bash() -> InspectionCheck:
-    if shutil.which("bash") is None:
+    # Don't trust the first PATH match blindly: on Windows, the WSL launcher
+    # shim at System32\bash.exe frequently resolves ahead of Git Bash and
+    # fails outright when WSL has no Linux distro installed. Try every
+    # candidate (same resolution order the install pipeline uses) until one
+    # actually runs. See runner._iter_bash_candidates for the full rationale.
+    from .runner import _iter_bash_candidates
+
+    candidates = _iter_bash_candidates()
+    if not candidates:
         return InspectionCheck(
             name="bash", status="failed",
             message="bash not found in PATH (required to run UDP scripts)"
         )
-    code, out = _run(["bash", "--version"])
-    if code == 0:
-        first = out.splitlines()[0] if out else "available"
-        return InspectionCheck(name="bash", status="passed", message=first[:120])
-    return InspectionCheck(name="bash", status="failed", message="bash --version failed")
+    tried: list[str] = []
+    for c in candidates:
+        code, out = _run([c, "--version"])
+        if code == 0:
+            first = out.splitlines()[0] if out else "available"
+            return InspectionCheck(name="bash", status="passed", message=first[:120])
+        tried.append(c)
+    return InspectionCheck(
+        name="bash", status="failed",
+        message="bash --version failed for every candidate on PATH",
+        detail=(
+            "Tried: " + ", ".join(tried) + ". On Windows this is usually the "
+            "WSL launcher shim at System32\\bash.exe shadowing Git Bash."
+        ),
+    )
 
 
 def _inspect_remote_cluster(stack: StackManifest, host: str) -> InspectionReport:

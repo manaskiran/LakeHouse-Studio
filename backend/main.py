@@ -864,9 +864,27 @@ def post_cart_validate(body: CartRequest):
 
 
 @app.get("/api/cart/recommended", dependencies=[AuthDep, CatalogOk])
-def get_recommended_cart():
+def get_recommended_cart(template: str | None = None, goal: str | None = None):
+    """Recommended cart for the current context.
+
+    "Use Recommended" must reflect the template/goal the user actually chose —
+    not a single hard-coded Iceberg set for every card. Resolves, in order:
+    the template's recommended_set, then the goal's recommended_set, then the
+    UDP default as a last resort.
+    """
     from .cart import recommended_cart
-    return {"cart": recommended_cart()}
+    from .catalog import recommended_sets as _rsets, load_catalog
+    if template:
+        detail = get_template_detail(template)
+        if detail and detail.get("cart"):
+            return {"cart": list(detail["cart"]), "source": f"template:{template}"}
+    if goal:
+        g = next((x for x in (load_catalog().get("goals", []) or []) if x.get("id") == goal), None)
+        if g:
+            comps = list((_rsets().get(g.get("recommended_set")) or {}).get("components") or [])
+            if comps:
+                return {"cart": comps, "source": f"goal:{goal}"}
+    return {"cart": recommended_cart(), "source": "udp-default"}
 
 
 # ---------- Lake names ----------
@@ -1350,11 +1368,19 @@ async def post_uninstall(install_id: str):
     rec = store.get(install_id)
     if not rec:
         raise HTTPException(404, "install not found")
+    from .uninstall import (uninstall as _do_uninstall,
+                            uninstall_custom as _do_uninstall_custom, UninstallError)
+    # Custom / Quick-Install builds have no stack manifest — they run off a
+    # generated docker-compose.yml, so they clean up via `docker compose down`.
+    if rec.outputs.get("custom_build"):
+        try:
+            return await _do_uninstall_custom(install_id, RUNNING_STATES, _INSTALL_TASKS)
+        except UninstallError as e:
+            raise HTTPException(409, str(e))
     try:
         m = load_manifest(rec.stack_id)
     except KeyError:
         raise HTTPException(404, "stack not found")
-    from .uninstall import uninstall as _do_uninstall, UninstallError
     try:
         result = await _do_uninstall(install_id, m, RUNNING_STATES, _INSTALL_TASKS)
     except UninstallError as e:
@@ -1810,7 +1836,7 @@ async def post_demo_query(install_id: str, body: DemoQueryRequest):
     if rec.state != "READY":
         raise HTTPException(409, f"install is in state {rec.state}; READY required")
     try:
-        result = await run_demo_query(body.query_id)
+        result = await run_demo_query(body.query_id, install_dir=rec.install_dir)
     except KeyError as e:
         raise HTTPException(404, str(e))
     return result
@@ -1848,7 +1874,7 @@ async def post_sql_editor(install_id: str, body: SqlEditorRequest):
         step="sql", line=f"[sql-editor] running: {audit_sql}",
     ))
 
-    result = await run_user_sql(body.sql, timeout=SQL_TIMEOUT_SEC)
+    result = await run_user_sql(body.sql, install_dir=rec.install_dir, timeout=SQL_TIMEOUT_SEC)
 
     # Enforce row cap
     if result.get("rows") and len(result["rows"]) > SQL_MAX_ROWS:

@@ -54,46 +54,73 @@ recommended_sets:
   # All use real component_registry.py IDs; minio-create-bucket is auto-added.
   local-demo:
     name: Local Demo Stack
-    components: [iceberg-rest, spark-iceberg, minio, trino]
+    stack_id: udp-local-v0.2
+    # `iceberg` (table format) belongs in the cart — udp-local-v0.2 is an
+    # Iceberg lakehouse. It also keeps the stack's marriage vocabulary
+    # complete so iceberg-format carts match here, not a Trino/BI sibling.
+    components: [iceberg, iceberg-rest, spark-iceberg, minio, starrocks]
 
   production-lakehouse:
     name: Production Lakehouse
-    # Nessie IS the catalog here (git-for-data) — iceberg-rest dropped to avoid
-    # the two-catalog mutual exclusion.
-    components: [nessie, spark-iceberg, minio, trino, airflow]
+    stack_id: iceberg-nessie-trino-local-v0.1
+    components: [nessie, spark-iceberg, minio, trino, starrocks, airflow]
 
   startup-analytics:
     name: Startup Analytics
-    components: [iceberg-rest, spark-iceberg, minio, starrocks, superset]
+    stack_id: startup-analytics-local-v0.1
+    components: [iceberg, iceberg-rest, spark-iceberg, minio, starrocks, superset]
 
   ai-ml-research:
     name: AI / ML Research
-    components: [iceberg-rest, spark-iceberg, minio, trino, jupyter]
+    stack_id: ai-ml-research-local-v0.1
+    components: [iceberg, iceberg-rest, spark-iceberg, minio, trino, jupyter, starrocks]
 
   healthcare-lakehouse:
     name: Healthcare Lakehouse
+    stack_id: enterprise-hadoop-v1.0
     components: [hdfs, hive-metastore, hadoop-yarn, spark-hudi, trino, ranger-admin]
 
   fintech-compliance:
     name: Fintech Compliance
-    components: [iceberg-rest, spark-iceberg, minio, trino, openlineage]
+    stack_id: fintech-compliance-local-v0.1
+    components: [iceberg, iceberg-rest, spark-iceberg, minio, trino, openlineage, starrocks]
 
   streaming-lakehouse:
     name: Streaming Lakehouse
-    components: [iceberg-rest, spark-iceberg, minio, kafka, flink]
+    stack_id: streaming-local-v1.0
+    components: [iceberg-rest, spark-iceberg, minio, kafka, flink, iceberg, starrocks]
 
   # ── Enterprise On-Prem (8th card) — full Hadoop datalake.
   enterprise-onprem:
     name: Enterprise On-Prem Datalake
+    stack_id: enterprise-hadoop-v1.0
     components: [hdfs, hive-metastore, spark-hudi, starrocks, trino, airflow, hadoop-yarn]
   enterprise-hadoop-docker-recommended:
     name: Enterprise Hadoop Docker (alias)
+    stack_id: enterprise-hadoop-v1.0
     components: [hdfs, hive-metastore, spark-hudi, starrocks, trino, airflow, hadoop-yarn]
+
+  # ── Non-Iceberg table formats, wired to their existing certified stacks so
+  # the wizard recognises them as certified (not "experimental") and can install
+  # them. Components mirror each stack's manifest (mysql-hms is an internal HMS
+  # sidecar, not a user-facing catalog id, so it's omitted from the cart). These
+  # HMS stacks have no StarRocks serving engine — they serve via Trino/Spark —
+  # which is why `serving` is an optional category.
+  delta-lakehouse:
+    name: Delta Lakehouse
+    stack_id: delta-hms-spark-trino-local-v0.1
+    components: [delta, hive-metastore, spark-delta, trino, minio]
+
+  hudi-lakehouse:
+    name: Hudi Lakehouse
+    stack_id: hudi-hms-spark-local-v0.1
+    components: [hudi, hive-metastore, spark-hudi, minio]
 
   # ── Legacy alias (kept so older references don't break).
   udp-recommended:
     name: UDP Reference Stack
-    components: [iceberg-rest, spark-iceberg, minio, starrocks]
+    stack_id: udp-local-v0.2
+    components: [iceberg, iceberg-rest, spark-iceberg, minio, starrocks]
 
 # ============================================================
 # Templates — use-case-shaped views over recommended_sets.
@@ -124,14 +151,14 @@ templates:
   - id: production_lakehouse
     label: Production Lakehouse
     icon: cube
-    elevator_pitch: Open lakehouse for real workloads — Iceberg + Nessie git-catalog + Trino + Airflow.
+    elevator_pitch: Open lakehouse for real workloads — Iceberg + Nessie git-catalog + Trino + Airflow + StarRocks.
     persona: Data platform team / mid-size company
     intended_for: ["production analytics", "multi-team data platforms", "any-industry lakehouses"]
     anti_use_cases: ["sub-second OLTP", "regulated PHI without your own controls"]
     recommended_set: production-lakehouse
     readiness: pilot
     validated: true
-    hero_use_cases: ["Git-for-data branching via Nessie", "Scheduled ETL with Airflow"]
+    hero_use_cases: ["Git-for-data branching via Nessie", "Scheduled ETL with Airflow", "Dual-engine querying via Trino + StarRocks"]
     pending_components: []
     compliance_tags: []
 
@@ -966,6 +993,12 @@ categories:
     label: Analytics / serving engine
     description: Fast SQL for dashboards, BI tools, and ad-hoc queries. Reads from the catalog at MPP speed.
     order: 5
+    # Optional: an MPP serving engine (StarRocks) accelerates BI but isn't
+    # mandatory — HMS-based stacks (Delta, Hudi) serve queries via Trino/Spark
+    # and ship no StarRocks. compat_explainer already treats serving as
+    # legitimately-absent for those stacks; keeping the required-category gate
+    # in sync so their carts validate as complete.
+    optional: true
     components:
       - id: starrocks
         name: StarRocks (FE + BE)

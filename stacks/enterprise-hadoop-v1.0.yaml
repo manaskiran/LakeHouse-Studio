@@ -26,7 +26,7 @@ requirements:
   # swap can pass the inspector. Note: heavy Hadoop/YARN workloads on swap are slow.
   # If your physical RAM is below ~24 GB, also lower YARN_NM_MEMORY_MB in .env (default 34816)
   # to something like 4096–8192 so YARN doesn't try to allocate containers larger than physical RAM.
-  minimum_ram_gb: 24
+  minimum_ram_gb: 20
   recommended_ram_gb: 48
   minimum_cpu_cores: 8
   recommended_cpu_cores: 16
@@ -38,9 +38,9 @@ requirements:
 # (Trino on stg01:8080 + Airflow on afw01:8080), the host mapping for the second is
 # shifted by +1 in docker-compose; container internal ports remain 8080 in both cases.
 ports:
-  required: [9820, 9871, 8090, 9083, 10000, 8030, 9030, 8080, 8081]
+  required: [9820, 9871, 8090, 9083, 10000, 8030, 9030, 28080, 28081]
   optional: [9866, 9867, 9865, 8044, 8048, 19890, 9020, 9050, 9060, 8050, 8060, 9070,
-             5432, 6432, 9090, 3000, 3100, 6080, 6182, 8983]
+             5432, 6432, 29090, 23000, 23100, 6080, 6182, 8983, 25673]
 
 commands:
   prefetch:
@@ -53,8 +53,15 @@ commands:
     argv: ["bash", "scripts/lhs-doctor.sh"]
     timeout: 60
   start:
-    argv: ["docker", "compose", "up", "--build", "-d"]
+    argv: ["bash", "-c", "BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up --build --no-recreate -d"]
     timeout: 7200
+    # NOT consumed by the raw `docker compose up` above (which starts ALL
+    # services in the compose). It IS read by runner._patch_compose_images to
+    # decide which depends_on edges to keep — listing the Celery broker and the
+    # Airflow one-shot/worker here prevents the pruner from stripping the
+    # `depends_on: airflow-init` (db migrate) edge, without which the webserver
+    # and scheduler crash-loop on "you need to initialize the database".
+    extra_services: [rabbitmq, airflow-init, airflow-scheduler, airflow-worker]
   bootstrap:
     type: script
     script: scripts/lhs-bootstrap.sh
@@ -68,24 +75,27 @@ commands:
 
 outputs:
   urls:
-    hdfs_namenode_ui:  { url: "https://localhost:9871", label: "HDFS NameNode UI (HTTPS_ONLY)" }
-    yarn_rm_ui:        { url: "http://localhost:8090",  label: "YARN ResourceManager" }
-    mr_history_ui:     { url: "http://localhost:19890", label: "MR History Server" }
-    hive_metastore:    { url: "thrift://localhost:9083", label: "Hive Metastore (Thrift)" }
-    hiveserver2_jdbc:  { url: "jdbc:hive2://localhost:10000", label: "HiveServer2 JDBC" }
-    hiveserver2_ui:    { url: "http://localhost:10002", label: "HiveServer2 Web UI" }
-    starrocks_ui:      { url: "http://localhost:8030",  label: "StarRocks FE UI" }
-    starrocks_mysql:   { url: "mysql://localhost:9030", label: "StarRocks (MySQL)" }
-    trino_ui:          { url: "http://localhost:8080",  label: "Trino Coordinator" }
-    airflow_ui:        { url: "http://localhost:8081",  label: "Airflow UI (host:8081 → container:8080)" }
-    prometheus_ui:     { url: "http://localhost:9090",  label: "Prometheus" }
-    grafana_ui:        { url: "http://localhost:3000",  label: "Grafana Dashboards" }
-    loki_api:          { url: "http://localhost:3100",  label: "Loki Log API" }
-    ranger_ui_http:    { url: "http://localhost:6080",  label: "Ranger Admin UI (HTTP)" }
-    ranger_ui_https:   { url: "https://localhost:6182", label: "Ranger Admin UI (HTTPS, like live)" }
-    solr_ui:           { url: "http://localhost:8983",  label: "Solr Admin UI" }
-    postgres:          { url: "postgresql://localhost:5432", label: "PostgreSQL 14 (HMS + Ranger + Airflow DB)" }
-    pgbouncer:         { url: "postgresql://localhost:6432", label: "PgBouncer (HMS pool)" }
+    # {host} is substituted with the install host at finalize (output_urls).
+    # Ports here are the DOCKER-published host ports, not the production "live"
+    # ports, so the links actually open on this install.
+    hdfs_namenode_ui:  { url: "http://{host}:9870",  label: "HDFS NameNode UI" }
+    yarn_rm_ui:        { url: "http://{host}:8088",  label: "YARN ResourceManager" }
+    mr_history_ui:     { url: "http://{host}:19888", label: "MR History Server" }
+    hive_metastore:    { url: "thrift://{host}:9083", label: "Hive Metastore (Thrift, internal — not host-published)" }
+    hiveserver2_jdbc:  { url: "jdbc:hive2://{host}:10000", label: "HiveServer2 JDBC" }
+    hiveserver2_ui:    { url: "http://{host}:10002", label: "HiveServer2 Web UI" }
+    starrocks_ui:      { url: "http://{host}:8030",  label: "StarRocks FE UI" }
+    starrocks_mysql:   { url: "mysql://{host}:9030", label: "StarRocks (MySQL)" }
+    trino_ui:          { url: "http://{host}:28080",  label: "Trino Coordinator (host:28080 → container:8080)" }
+    airflow_ui:        { url: "http://{host}:28081",  label: "Airflow UI (host:28081 → container:8080)" }
+    prometheus_ui:     { url: "http://{host}:29090",  label: "Prometheus" }
+    grafana_ui:        { url: "http://{host}:23000",  label: "Grafana Dashboards" }
+    loki_api:          { url: "http://{host}:23100",  label: "Loki Log API" }
+    ranger_ui_http:    { url: "http://{host}:6080",  label: "Ranger Admin UI (HTTP)" }
+    ranger_ui_https:   { url: "https://{host}:6182", label: "Ranger Admin UI (HTTPS, like live)" }
+    solr_ui:           { url: "http://{host}:8983",  label: "Solr Admin UI" }
+    postgres:          { url: "postgresql://{host}:5433", label: "PostgreSQL 14 (HMS + Ranger + Airflow DB)" }
+    pgbouncer:         { url: "postgresql://{host}:6432", label: "PgBouncer (HMS pool)" }
   connections:
     starrocks_mysql: "mysql -h 127.0.0.1 -P 9030 -u root"
     hdfs_shell:      "docker exec ehd-namenode hdfs dfs -ls /"
