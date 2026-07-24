@@ -28,6 +28,7 @@ load_dotenv()
 import litellm
 
 from . import compat_ai
+from . import ai_safety
 from .stack_manifest import load_manifest, StackManifest
 
 log = logging.getLogger("lhs.ai_provisioner")
@@ -36,6 +37,38 @@ litellm.suppress_debug_info = True
 _BASE_URL = os.environ.get("LITELLM_BASE_URL", "")
 _API_KEY  = os.environ.get("LITELLM_API_KEY", "")
 _MODEL    = os.environ.get("LITELLM_MODEL", "gpt-4o-mini")
+
+# Env var an operator sets to opt IN to AI-driven provisioning (default off).
+PROVISION_ENABLE_ENV = "LHS_AI_PROVISION_ENABLED"
+_LLM_KEY_ENVS = ("LITELLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+
+
+def _is_truthy(value) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ("", "0", "false", "no", "off", "disable", "disabled")
+
+
+def provisioning_status() -> tuple[bool, str]:
+    """AI-driven provisioning is OPT-IN (security default: off).
+
+    It lets an LLM generate configs + shell commands that then run against the
+    host's Docker — even with the ai_safety gate, that surface should not be
+    reachable unless an operator explicitly turns it on. Returns
+    (enabled, human-readable reason when disabled).
+    """
+    if not _is_truthy(os.environ.get(PROVISION_ENABLE_ENV)):
+        return False, (
+            "AI-driven provisioning is disabled by default. An operator must set "
+            f"{PROVISION_ENABLE_ENV}=1 to opt in — it lets an LLM generate configs "
+            "and commands that run against Docker."
+        )
+    if not any(os.environ.get(k) for k in _LLM_KEY_ENVS):
+        return False, (
+            f"{PROVISION_ENABLE_ENV} is set but no LLM API key is configured "
+            "(LITELLM_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)."
+        )
+    return True, ""
 
 # Global job registry
 _PROV_JOBS: dict[str, "ProvisionJob"] = {}
@@ -343,6 +376,12 @@ def _run_post_start_commands(commands: list[dict], emit_log: Callable) -> None:
         cmd  = item.get("cmd", "")
         if not cmd:
             continue
+        # LLM output is untrusted — gate every command before it reaches a shell.
+        ok, reason = ai_safety.vet_provisioning_command(cmd)
+        if not ok:
+            emit_log(f"  ⛔ refused unsafe AI command ({reason}): {cmd[:120]}")
+            log.warning("refused unsafe AI post-start command (%s): %s", reason, cmd)
+            continue
         emit_log(f"  running: {desc or cmd}")
         try:
             result = subprocess.run(
@@ -359,18 +398,33 @@ def _run_post_start_commands(commands: list[dict], emit_log: Callable) -> None:
 
 
 def _inject_trino_catalogs(catalog_files: dict[str, str], emit_log: Callable) -> None:
-    for name, content in catalog_files.items():
-        if not name.endswith(".properties"):
-            name = name + ".properties"
+    for raw_name, content in catalog_files.items():
+        # LLM output is untrusted — strict-validate the filename (it becomes a
+        # path segment) and pass content over stdin so it is NEVER interpolated
+        # into a shell string. No shell=True; argv only.
+        try:
+            name = ai_safety.validate_catalog_filename(raw_name)
+        except ValueError as e:
+            emit_log(f"  ⛔ refused unsafe catalog filename {raw_name!r}: {e}")
+            log.warning("refused unsafe AI catalog filename: %r", raw_name)
+            continue
+        if not isinstance(content, str):
+            emit_log(f"  ⚠ {name}: skipped (content is not text)")
+            continue
         emit_log(f"  writing Trino catalog: {name}")
         try:
-            escaped = content.replace("'", "'\"'\"'")
-            cmd = (
-                f"docker exec udp-trino mkdir -p /data/trino/etc/catalog && "
-                f"docker exec -i udp-trino bash -c 'cat > /data/trino/etc/catalog/{name}' "
-                f"<<'__TRINOEOF__'\n{content}\n__TRINOEOF__"
+            subprocess.run(
+                ["docker", "exec", "udp-trino", "mkdir", "-p",
+                 "/data/trino/etc/catalog"],
+                capture_output=True, text=True, timeout=30,
             )
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            # `sh -c 'cat > <validated-path>'` inside the container; the payload
+            # arrives on stdin, so its bytes are never parsed by any shell.
+            result = subprocess.run(
+                ["docker", "exec", "-i", "udp-trino", "sh", "-c",
+                 f"cat > /data/trino/etc/catalog/{name}"],
+                input=content, capture_output=True, text=True, timeout=30,
+            )
             if result.returncode == 0:
                 emit_log(f"  ✓ {name} written")
             else:
@@ -394,6 +448,13 @@ def _run_connectivity_checks(checks: list[dict], emit_log: Callable) -> list[dic
         name = check.get("name", "?")
         cmd  = check.get("cmd", "")
         if not cmd:
+            continue
+        # LLM output is untrusted — gate the probe command before running it.
+        safe, reason = ai_safety.vet_provisioning_command(cmd)
+        if not safe:
+            emit_log(f"  ⛔ {name}: refused unsafe check ({reason})")
+            log.warning("refused unsafe AI connectivity check (%s): %s", reason, cmd)
+            results.append({"name": name, "ok": False})
             continue
         try:
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)

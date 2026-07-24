@@ -54,6 +54,14 @@ _HMS_IMAGE = "bitsondatadev/hive-metastore:latest"
 # ETL (e.g. Nessie). Delta/Hudi/hadoop-aws come in at submit time via --packages.
 _SPARK_ICEBERG_IMAGE = "tabulario/spark-iceberg:3.5.5_1.8.1"
 _POLARIS_IMAGE = "apache/polaris:1.4.1"  # bumped from 1.0.1 — that tag never published; 1.4.1 is real + has CVE fixes (Gemini research 2026-05-17, verified via docker manifest inspect)
+# Polaris 1.4.x with relational-jdbc persistence needs its Postgres schema
+# CREATED before the server can serve tokens — the server's own
+# POLARIS_BOOTSTRAP_CREDENTIALS env seeds the realm but does NOT create the
+# `polaris_schema` tables, so the token endpoint 500s with
+# `relation "polaris_schema.entities" does not exist`. The admin-tool
+# `bootstrap` command creates the schema + realm + root principal. Verified on
+# the Finalert VPS 2026-07-17.
+_POLARIS_ADMIN_IMAGE = "apache/polaris-admin-tool:1.4.1"
 _POSTGRES_IMAGE = "postgres:15-alpine"
 _MYSQL_IMAGE = "mysql:8.0"
 # Trino 481 — updated from 475 on 2026-06-17 to match lock files.
@@ -91,7 +99,7 @@ FRAGMENT_SERVICES: dict[str, list[str]] = {
     "iceberg-nessie-trino-local-v0.1":  ["nessie", "trino", "postgres-airflow", "airflow", "spark", "mysql-hms", "hive-metastore"],
     "hudi-hms-spark-local-v0.1":        ["mysql-hms", "hive-metastore"],
     "delta-hms-spark-trino-local-v0.1": ["mysql-hms", "hive-metastore", "trino"],
-    "iceberg-polaris-spark-local-v0.1": ["postgres-polaris", "polaris"],
+    "iceberg-polaris-spark-local-v0.1": ["postgres-polaris", "polaris-bootstrap", "polaris"],
 }
 
 
@@ -196,9 +204,11 @@ def _render_udp_trino_fragment(env: dict) -> str:
     -d minio iceberg-rest trino starrocks-fe starrocks-be create-bucket`
     — without this fragment that fails with `no such service: trino`.
 
-    Trino-only fragment (no Nessie, no HMS). The stack uses the upstream
-    iceberg-rest catalog, which the bootstrap wires via
-    /etc/trino/catalog/iceberg.properties after Trino starts.
+    The stack uses the upstream iceberg-rest catalog (wired by the bootstrap
+    via /etc/trino/catalog/iceberg.properties after Trino starts). Per the
+    v0.6.2 multi-format refactor it also gets the shared MySQL + HMS pair so a
+    user who adds Delta/Hudi can register those catalogs against StarRocks;
+    the HMS is unused for the pure-Iceberg case.
     """
     return (
         "# docker-compose.fragment.yml -- Trino service for "
@@ -358,9 +368,12 @@ def _render_fintech_fragment(env: dict) -> str:
         "    depends_on:\n"
         "      postgres-marquez:\n"
         "        condition: service_healthy\n"
+        # Host-side ports are env-overridable so the stack coexists with
+        # anything already bound to 5000/5001 on the host (e.g. another app's
+        # dashboard). Container ports stay 5000/5001. Default keeps 5000/5001.
         "    ports:\n"
-        "      - \"5000:5000\"\n"
-        "      - \"5001:5001\"\n"
+        "      - \"${MARQUEZ_HTTP_PORT:-5000}:5000\"\n"
+        "      - \"${MARQUEZ_ADMIN_PORT:-5001}:5001\"\n"
         "    healthcheck:\n"
         "      test: [\"CMD-SHELL\", \"wget -qO- http://localhost:5000/api/v1/namespaces >/dev/null 2>&1 || exit 1\"]\n"
         "      interval: 15s\n"
@@ -385,7 +398,7 @@ def _render_fintech_fragment(env: dict) -> str:
         "      openlineage:\n"
         "        condition: service_started\n"
         "    ports:\n"
-        "      - \"3000:3000\"\n"
+        "      - \"${MARQUEZ_WEB_PORT:-3000}:3000\"\n"
         "    networks:\n"
         "      - default\n"
         # Hive Metastore so Fintech Compliance is multi-format too (Delta/Hudi catalogs).
@@ -877,6 +890,26 @@ def _render_polaris_fragment(env: dict) -> str:
         "      retries: 10\n"
         "    networks:\n"
         "      - default\n"
+        # One-shot schema bootstrap. Creates the polaris_schema tables + the
+        # `default-realm` realm + root principal in Postgres BEFORE the server
+        # starts, so the server never 500s on a missing schema. Exits 0 on
+        # success; the server depends_on it completing.
+        "  polaris-bootstrap:\n"
+        f"    image: {_POLARIS_ADMIN_IMAGE}\n"
+        "    container_name: udp-polaris-bootstrap\n"
+        "    restart: \"no\"\n"
+        "    depends_on:\n"
+        "      postgres-polaris:\n"
+        "        condition: service_healthy\n"
+        "    environment:\n"
+        "      POLARIS_PERSISTENCE_TYPE: relational-jdbc\n"
+        "      QUARKUS_DATASOURCE_DB_KIND: postgresql\n"
+        "      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres-polaris:5432/polaris?sslmode=disable\n"
+        "      QUARKUS_DATASOURCE_USERNAME: polaris\n"
+        "      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris_password_pilot}\n"
+        "    command: [\"bootstrap\", \"--realm\", \"default-realm\", \"--credential\", \"${POLARIS_BOOTSTRAP_CREDENTIALS:-default-realm,root,s3cr3t}\"]\n"
+        "    networks:\n"
+        "      - default\n"
         "  polaris:\n"
         f"    image: {_POLARIS_IMAGE}\n"
         "    container_name: udp-polaris\n"
@@ -884,6 +917,8 @@ def _render_polaris_fragment(env: dict) -> str:
         "    depends_on:\n"
         "      postgres-polaris:\n"
         "        condition: service_healthy\n"
+        "      polaris-bootstrap:\n"
+        "        condition: service_completed_successfully\n"
         "    environment:\n"
         # Codex P0 fix 2026-05-17: Polaris 1.4.x uses Quarkus datasource
         # env vars + the persistence type is `relational-jdbc`, not `jdbc`.
@@ -913,6 +948,13 @@ def _render_polaris_fragment(env: dict) -> str:
         "      # bootstrap, Spark, and StarRocks.\n"
         "      # Ref: https://polaris.apache.org/docs/configuration/#bootstrapping\n"
         "      POLARIS_REALM_CONTEXT_REALMS: default-realm\n"
+        # Polaris (the SERVER) writes table metadata to MinIO/S3 itself, so it
+        # needs S3 credentials. Without them CREATE TABLE fails server-side with
+        # `Unable to load credentials from any of the providers`. The AWS SDK's
+        # EnvironmentVariableCredentialsProvider reads these. VPS-verified.
+        "      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}\n"
+        "      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-udp_admin_12345}\n"
+        "      AWS_REGION: us-east-1\n"
         "    ports:\n"
         "      - \"8181:8181\"\n"
         "      - \"8182:8182\"\n"

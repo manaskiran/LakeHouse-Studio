@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from . import compose_hardening
+from . import credential_gen
 from .config import WORK_DIR
 from .etl_verify_job import ETL_VERIFY_SPARK_PY
 from .events import bus
@@ -831,6 +833,14 @@ _ENV_ALLOW = {
     "COLUMNS", "LINES", "TERM",
     # systemroot is needed for various Windows shell utilities
     "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "WINDIR", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    # Compose-fragment host-port + tuning overrides (non-secret) that
+    # stack_compose_fragments.py interpolates as `${VAR:-default}`. Passing
+    # these through lets an operator dodge host-port conflicts (e.g. Marquez's
+    # 5000 colliding with another app) without editing any file. Credentials
+    # are still dropped — only ports/opts are whitelisted here.
+    "MARQUEZ_HTTP_PORT", "MARQUEZ_ADMIN_PORT", "MARQUEZ_WEB_PORT",
+    "TRINO_HTTP_PORT", "TRINO_JAVA_OPTS",
+    "TRINO_QUERY_MAX_MEMORY", "TRINO_QUERY_MAX_MEMORY_PER_NODE",
 }
 
 
@@ -970,8 +980,13 @@ class UDPRunner:
 
     # ---------- subprocess plumbing ----------
 
-    async def _run_bash(self, step_id: str, argv: list[str], cwd: Path, timeout: int) -> int:
-        """Run a command under bash so UDP's shell scripts work cross-platform."""
+    async def _run_bash(self, step_id: str, argv: list[str], cwd: Path, timeout: int,
+                        extra_env: dict[str, str] | None = None) -> int:
+        """Run a command under bash so UDP's shell scripts work cross-platform.
+
+        *extra_env* is merged over the base subprocess env — used to point
+        `docker compose` at the hardening overlay via COMPOSE_FILE for stacks
+        whose start command doesn't pass explicit `-f`."""
         bash = _bash_executable()
         posix_cwd = _to_posix_path(cwd)
         quoted = " ".join(self._sh_quote(a) for a in argv)
@@ -981,6 +996,8 @@ class UDPRunner:
         self._log(step_id, "stdout", redact(f"$ {cmd_str}"))
 
         env = _build_subprocess_env()
+        if extra_env:
+            env.update(extra_env)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1444,6 +1461,90 @@ class UDPRunner:
                   f"{path.name} ({len(services)} service"
                   f"{'s' if len(services) != 1 else ''})")
 
+    def _effective_service_names(self) -> list[str]:
+        """Ground-truth set of services `docker compose up` will touch: parse the
+        base cloned compose PLUS every registered overlay/fragment FILE and union
+        their service keys. Parsing the actual files (not each overlay's declared
+        `services` metadata) means a service defined in an overlay file is hardened
+        even if the writer forgot to list it — hardening coverage never silently
+        lags the real compose model. Read-only (keys only) — never re-serializes a
+        file, so the fragile StarRocks command heredocs are left untouched.
+
+        Falls back to an overlay's declared `services` only when its file can't be
+        parsed, and emits a prominent SECURITY warning if the BASE compose can't be
+        parsed (that would leave the bulk of the stack unhardened)."""
+        import yaml
+
+        def _service_keys(path: Path) -> list[str] | None:
+            try:
+                doc = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+                return list((doc.get("services") or {}).keys())
+            except Exception:
+                return None
+
+        names: list[str] = []
+        base = self.install_dir / "docker-compose.yml"
+        if base.exists():
+            keys = _service_keys(base)
+            if keys is None:
+                self._log("env", "stderr",
+                          "SECURITY: harden could not parse base docker-compose.yml; "
+                          "the runtime hardening overlay will cover overlay services "
+                          "only — base services may run UNHARDENED")
+            else:
+                names.extend(keys)
+        for ov in self._overlays:
+            f = ov.get("file")
+            keys = _service_keys(f) if f else None
+            # Trust the file's actual service keys; fall back to declared metadata
+            # only when the file is missing/unparseable.
+            names.extend(keys if keys is not None else (ov.get("services") or []))
+        return list(dict.fromkeys(n for n in names if n))
+
+    def _write_harden_overlay(self, env: dict[str, str]) -> None:
+        """P0.2 — write docker-compose.harden.yml and register it LAST so its
+        runtime security options layer over the base compose + fragment + any
+        opt-in overlays.
+
+        Default ON: security_opt no-new-privileges on every service (safe for
+        all certified stacks). Disable with LHS_HARDEN_RUNTIME_DISABLED=1.
+        Strict cap-drop/pids-limit is opt-in via LHS_HARDEN_STRICT (needs
+        per-stack verification before it can be trusted)."""
+        if (_is_truthy(env.get(compose_hardening.DISABLE_ENV))
+                or _is_truthy(os.environ.get(compose_hardening.DISABLE_ENV))):
+            self._log("env", "stdout",
+                      f"runtime hardening disabled via "
+                      f"{compose_hardening.DISABLE_ENV}")
+            return
+        names = self._effective_service_names()
+        if not names:
+            self._log("env", "stderr",
+                      "harden: no services resolved; skipping hardening overlay")
+            return
+        strict = (_is_truthy(env.get(compose_hardening.STRICT_ENV))
+                  or _is_truthy(os.environ.get(compose_hardening.STRICT_ENV)))
+        doc = compose_hardening.build_harden_overlay(names, strict=strict)
+        import yaml
+        path = self.install_dir / compose_hardening.OVERLAY_FILENAME
+        path.write_text(
+            yaml.dump(doc, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+        # Register with NO services: the overlay only modifies services that are
+        # already started by earlier -f files, it must not add to the `up -d`
+        # service list. Drop any pre-existing 'harden' entry first so re-runs
+        # never produce duplicate `-f docker-compose.harden.yml` flags.
+        self._overlays = [o for o in self._overlays if o.get("name") != "harden"]
+        self._overlays.append({
+            "name": "harden",
+            "file": path,
+            "services": [],
+        })
+        self._log("env", "stdout",
+                  f"runtime hardening overlay written: {path.name} "
+                  f"({len(names)} service{'s' if len(names) != 1 else ''}, "
+                  f"strict={strict})")
+
     def _write_optional_overlays(self, env: dict[str, str]) -> None:
         """v0.6.1 — write opt-in compose overlays (Airflow / Dagster / Superset)
         next to the base compose file.
@@ -1649,6 +1750,22 @@ class UDPRunner:
             import secrets as _sec
             merged["AIRFLOW_WEBSERVER_SECRET_KEY"] = _sec.token_hex(32)
 
+        # P0.4b — opt-in per-install credential generation (default OFF). When
+        # LHS_GENERATE_CREDENTIALS is set, replace the shipped demo MinIO secret
+        # with a strong random one so no two installs share the public default.
+        # Default path is byte-identical: without the flag nothing is generated
+        # and every consumer resolves to ${MINIO_ROOT_PASSWORD:-udp_admin_12345}.
+        # An explicit operator override always wins over generation.
+        self._generated_minio_secret: str | None = None
+        gen_creds = (_is_truthy(merged.get(credential_gen.GENERATE_ENV))
+                     or _is_truthy(os.environ.get(credential_gen.GENERATE_ENV)))
+        if gen_creds and not clean_overrides.get(credential_gen.MINIO_SECRET_ENV):
+            self._generated_minio_secret = credential_gen.generate_secret()
+            merged[credential_gen.MINIO_SECRET_ENV] = self._generated_minio_secret
+            self._log("env", "stdout",
+                      "P0.4b: generated a per-install MinIO secret "
+                      f"({credential_gen.MINIO_SECRET_ENV}=********)")
+
         # Patch Spark's catalog config: swap the default `udp` catalog from
         # hive-metastore-backed to iceberg-REST-backed so the Spark bootstrap
         # job works without hive-metastore. UDP ships a parallel `udp_rest`
@@ -1684,6 +1801,15 @@ class UDPRunner:
         except Exception as e:
             self._log("env", "stderr", f"stack fragment write warning: {e}")
 
+        # P0.2 — write the runtime hardening overlay LAST, after fragment +
+        # optional overlays are registered, so it can enumerate and harden
+        # every service that will actually start. Non-fatal: a hardening write
+        # failure must never block the certified stack from coming up.
+        try:
+            self._write_harden_overlay(merged)
+        except Exception as e:
+            self._log("env", "stderr", f"harden overlay write warning: {e}")
+
         # Make UDP scripts executable. On Windows chmod is a near-noop, but on
         # Linux/macOS it matters. Don't swallow surprising errors silently.
         try:
@@ -1705,6 +1831,15 @@ class UDPRunner:
                 env_path.chmod(0o600)
             except Exception:
                 pass
+            # P0.4b — with a generated secret in hand, sweep the install dir and
+            # replace the shipped demo literal everywhere it was written (bootstrap
+            # + smoke scripts, patched compose, StarRocks conf injection, configs).
+            # Runs AFTER every env-step writer, so it catches all of them at once.
+            if self._generated_minio_secret:
+                self._rotate_install_credential(
+                    credential_gen.DEMO_MINIO_SECRET,
+                    self._generated_minio_secret,
+                )
             # Echo redacted preview line-by-line.
             for k, v in merged.items():
                 is_secret = (
@@ -1769,6 +1904,22 @@ class UDPRunner:
                     })
         except ImportError:
             pass
+        # P0.2 runtime hardening overlay — LAST, so it layers over everything.
+        # services:[] because it only modifies services started by other files.
+        # Honor a now-set disable flag: a stale overlay file from a prior run
+        # must NOT silently re-harden when the operator has since disabled it.
+        # Dedupe first so a retry never doubles the `-f` flag.
+        self._overlays = [o for o in self._overlays if o.get("name") != "harden"]
+        harden = self.install_dir / compose_hardening.OVERLAY_FILENAME
+        disabled = _is_truthy(os.environ.get(compose_hardening.DISABLE_ENV))
+        if harden.exists() and not disabled:
+            self._overlays.append({
+                "name": "harden",
+                "file": harden,
+                "services": [],
+            })
+            self._log("start", "stdout",
+                      f"recovered hardening overlay from disk: {harden.name}")
 
     async def _step_cmd(self, step_id: str, cmd_name: str) -> bool:
         self._step_start(step_id)
@@ -1827,10 +1978,69 @@ class UDPRunner:
         else:
             argv = list(spec["argv"])
 
-        rc = await self._run_bash(step_id, argv, self.install_dir, int(spec.get("timeout", 600)))
+        # P0.2 — raw-argv start commands (enterprise-hadoop / streaming /
+        # techsophy run `docker compose up` with NO explicit -f, so they don't
+        # inherit the hardening overlay the docker_compose_up branch injects.
+        # Point compose at base + harden via COMPOSE_FILE for the start step.
+        # Compose ignores COMPOSE_FILE when explicit -f is passed (the
+        # docker_compose_up branch), so this is safe for every stack.
+        extra_env: dict[str, str] | None = None
+        if step_id == "start":
+            harden = self.install_dir / compose_hardening.OVERLAY_FILENAME
+            base_name = self._base_compose_filename()
+            if harden.exists() and base_name:
+                extra_env = {
+                    "COMPOSE_FILE": base_name + os.pathsep + harden.name,
+                }
+                self._log(step_id, "stdout",
+                          f"compose: COMPOSE_FILE={extra_env['COMPOSE_FILE']} "
+                          f"(runtime hardening overlay applied)")
+
+        rc = await self._run_bash(step_id, argv, self.install_dir,
+                                  int(spec.get("timeout", 600)), extra_env=extra_env)
         ok = rc == 0
         self._step_end(step_id, ok, exit_code=rc)
         return ok
+
+    def _rotate_install_credential(self, old: str, new: str) -> None:
+        """P0.4b — replace the unique demo secret *old* with *new* across every
+        text artifact in install_dir (bootstrap/smoke scripts, patched compose,
+        StarRocks conf injection, generated configs, .env defaults).
+
+        A plain string replace of an UNAMBIGUOUS literal — no YAML round-trip, so
+        the fragile StarRocks command heredocs are preserved. Binary and .git
+        files are skipped. Idempotent: files without *old* are untouched."""
+        if not old or old == new:
+            return
+        changed = 0
+        for root, dirs, files in os.walk(self.install_dir):
+            if ".git" in dirs:
+                dirs.remove(".git")
+            for fn in files:
+                p = Path(root) / fn
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue  # binary or unreadable — not a credential carrier
+                if old in text:
+                    try:
+                        p.write_text(text.replace(old, new), encoding="utf-8")
+                        changed += 1
+                    except OSError as e:
+                        self._log("env", "stderr",
+                                  f"P0.4b: could not rewrite {p.name}: {e}")
+        self._log("env", "stdout",
+                  f"P0.4b: rotated demo MinIO secret across {changed} install file(s)")
+
+    def _base_compose_filename(self) -> str | None:
+        """Name of the stack's base compose file in install_dir, if present.
+        Compose's standard discovery order — used to build COMPOSE_FILE so the
+        hardening overlay merges over the right base."""
+        for name in ("docker-compose.yml", "docker-compose.yaml",
+                     "compose.yml", "compose.yaml"):
+            if (self.install_dir / name).exists():
+                return name
+        return None
 
     async def _step_finalize(self) -> bool:
         self._step_start("finalize")

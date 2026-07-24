@@ -460,7 +460,11 @@ PYEOF
 
 echo "[studio-hudi-bootstrap] running pyspark Hudi seed job..."
 docker exec udp-spark spark-submit \
-  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0 \
+  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.sql.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.hive.metastore.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
   --conf spark.hadoop.fs.s3a.access.key=admin \
   --conf spark.hadoop.fs.s3a.secret.key=udp_admin_12345 \
@@ -531,7 +535,11 @@ PYEOF
 
 echo "[studio-hudi-smoke] running pyspark Hudi smoke job..."
 docker exec udp-spark spark-submit \
-  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0 \
+  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.sql.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.hive.metastore.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
   --conf spark.hadoop.fs.s3a.access.key=admin \
   --conf spark.hadoop.fs.s3a.secret.key=udp_admin_12345 \
@@ -550,7 +558,11 @@ docker exec \
   -e ETLV_WAREHOUSE=s3a://datalake/warehouse -e ETLV_HMS=thrift://hive-metastore:9083 \
   -e ETLV_S3_ENDPOINT=http://minio:9000 -e ETLV_S3_KEY=admin -e ETLV_S3_SECRET=udp_admin_12345 \
   udp-spark spark-submit \
-  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0 \
+  --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.sql.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.hive.metastore.warehouse.dir=s3a://datalake/warehouse \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
   --conf spark.hadoop.fs.s3a.access.key=admin \
   --conf spark.hadoop.fs.s3a.secret.key=udp_admin_12345 \
@@ -678,9 +690,9 @@ PYEOF
 
 echo "[studio-delta-bootstrap] running pyspark Delta seed job..."
 docker exec udp-spark spark-submit \
-  --jars /opt/spark/jars/hadoop-aws-3.3.4.jar,/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/jars/delta-spark_2.12-3.2.1.jar,/opt/spark/jars/delta-storage-3.2.1.jar \
-  --conf spark.driver.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
-  --conf spark.executor.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+  --packages io.delta:delta-spark_2.12:3.2.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
   --conf spark.hadoop.fs.s3a.access.key=admin \
   --conf spark.hadoop.fs.s3a.secret.key=udp_admin_12345 \
@@ -746,14 +758,20 @@ for i in $(seq 1 24); do
   echo "  ($i/24) delta catalog not yet visible"; sleep 5
 done
 
-echo "[studio-delta-bootstrap] registering Delta tables in Trino delta catalog..."
-# Trino delta-lake requires explicit registration when the schema/table
-# exist in HMS but not yet known to the Trino catalog. Idempotent: failing
-# because "already registered" is fine.
-docker exec -e JAVA_TOOL_OPTIONS= -i udp-trino trino <<'SQL'
-CALL delta.system.register_table(schema_name => 'delta_raw',     table_name => 'demo_customers',         table_location => 's3://datalake/warehouse/delta_raw/demo_customers');
-CALL delta.system.register_table(schema_name => 'delta_curated', table_name => 'demo_customer_summary', table_location => 's3://datalake/warehouse/delta_curated/demo_customer_summary');
-SQL
+# Spark's saveAsTable already registered both Delta tables in HMS, and Trino's
+# delta-lake connector reads them straight from HMS — so no register_table CALL
+# is needed (Trino also disables that procedure by default, which used to abort
+# the bootstrap). Verify Trino can actually read them via HMS instead.
+echo "[studio-delta-bootstrap] verifying Trino sees the Delta tables via HMS..."
+for i in $(seq 1 12); do
+  if docker exec -e JAVA_TOOL_OPTIONS= udp-trino trino --execute \
+       "SELECT COUNT(*) FROM delta.delta_raw.demo_customers" 2>/dev/null \
+       | tr -d '"' | tr -d '\r' | grep -q '^5$'; then
+    echo "  Trino reads delta_raw.demo_customers (5 rows) OK"; break
+  fi
+  echo "  ($i/12) delta tables not visible to Trino yet"; sleep 5
+  if [ "$i" = "12" ]; then echo "delta tables never became visible to Trino"; exit 1; fi
+done
 
 echo "[studio-delta-bootstrap] complete"
 """
@@ -806,9 +824,9 @@ PYEOF
 
 echo "[studio-delta-smoke] running pyspark Delta smoke job..."
 docker exec udp-spark spark-submit \
-  --jars /opt/spark/jars/hadoop-aws-3.3.4.jar,/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/jars/delta-spark_2.12-3.2.1.jar,/opt/spark/jars/delta-storage-3.2.1.jar \
-  --conf spark.driver.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
-  --conf spark.executor.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+  --packages io.delta:delta-spark_2.12:3.2.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
   --conf spark.hadoop.fs.s3a.access.key=admin \
   --conf spark.hadoop.fs.s3a.secret.key=udp_admin_12345 \
@@ -840,9 +858,9 @@ docker exec \
   -e ETLV_WAREHOUSE=s3a://datalake/warehouse -e ETLV_HMS=thrift://hive-metastore:9083 \
   -e ETLV_S3_ENDPOINT=http://minio:9000 -e ETLV_S3_KEY=admin -e ETLV_S3_SECRET=udp_admin_12345 \
   udp-spark spark-submit \
-  --jars /opt/spark/jars/hadoop-aws-3.3.4.jar,/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/jars/delta-spark_2.12-3.2.1.jar,/opt/spark/jars/delta-storage-3.2.1.jar \
-  --conf spark.driver.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
-  --conf spark.executor.extraClassPath=/opt/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+  --packages io.delta:delta-spark_2.12:3.2.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  --conf spark.sql.defaultCatalog=spark_catalog \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   //tmp/lhs/lhs_etl_verify.py
 
 echo "[studio-delta-smoke] passed"
@@ -1021,10 +1039,17 @@ curl -s -o /dev/null -X POST \
   -H "Content-Type: application/json" \
   -d '{ "principalRole": { "name": "service_admin" } }' || true
 
-# 4. Assign the principal to the principal-role.
+# 4. Assign the principal to the principal-role. Polaris 1.4.1 exposes this as
+#    PUT /principals/{name}/principal-roles with the role in the body. The
+#    inverse path (/principal-roles/{role}/principals/{name}) returns 404
+#    "Unable to find matching target resource method", which — swallowed by
+#    `|| true` — silently left the principal with ZERO roles, so every catalog
+#    op 403'd with "not authorized for op CREATE_NAMESPACE". VPS-verified fix.
 curl -s -o /dev/null -X PUT \
-  "${POLARIS_MGMT}/principal-roles/service_admin/principals/${PRINCIPAL_NAME}" \
-  -H "Authorization: Bearer ${ROOT_TOKEN}" || true
+  "${POLARIS_MGMT}/principals/${PRINCIPAL_NAME}/principal-roles" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{ "principalRole": { "name": "service_admin" } }' || true
 
 # 5. Bind the engineer catalog-role to the service_admin principal-role.
 #    This is the critical link that was missing -- without it, the
@@ -1083,6 +1108,11 @@ catalog = os.environ["POLARIS_CATALOG_NAME"]
 spark = (
     SparkSession.builder.appName("lhs-polaris-bootstrap")
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    # The base spark image bakes spark.sql.defaultCatalog=udp (an Iceberg-REST
+    # catalog at iceberg-rest:8181, which is NOT in this stack). Pin the default
+    # to the Polaris catalog, or Spark initializes `udp` while resolving
+    # currentNamespace and dies with UnknownHostException. VPS-verified.
+    .config("spark.sql.defaultCatalog", catalog)
     .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
     .config(f"spark.sql.catalog.{catalog}.type", "rest")
     .config(f"spark.sql.catalog.{catalog}.uri", os.environ["POLARIS_CATALOG_URI"])
@@ -1195,10 +1225,16 @@ PROPERTIES (
     -- token endpoint, not the base catalog URL.
     -- Ref: https://docs.starrocks.io/docs/external_table/iceberg_catalog/
     --      https://polaris.apache.org/docs/oauth
-    "iceberg.catalog.security" = "oauth2",
-    "iceberg.catalog.oauth2.server-uri" = "http://polaris:8181/api/catalog/v1/oauth/tokens",
-    "iceberg.catalog.oauth2.credential" = "${CLIENT_ID}:${CLIENT_SECRET}",
-    "iceberg.catalog.oauth2.scope" = "PRINCIPAL_ROLE:ALL",
+    -- StarRocks strips the `iceberg.catalog.` prefix and hands the rest to the
+    -- Iceberg REST client, which reads the RAW spec keys `credential`,
+    -- `oauth2-server-uri`, `scope`. The StarRocks-invented `oauth2.*` /
+    -- `security=oauth2` names are NOT recognised by that client, so StarRocks
+    -- skipped auth entirely and Polaris returned 401 (principal `-`). VPS-
+    -- verified: with the raw keys, StarRocks performs the OAuth2
+    -- client_credentials flow and lists the Polaris namespaces (200).
+    "iceberg.catalog.credential" = "${CLIENT_ID}:${CLIENT_SECRET}",
+    "iceberg.catalog.oauth2-server-uri" = "http://polaris:8181/api/catalog/v1/oauth/tokens",
+    "iceberg.catalog.scope" = "PRINCIPAL_ROLE:ALL",
     "iceberg.catalog.vended-credentials-enabled" = "true",
     -- Gemini Polaris 1.4.1 audit 2026-05-17: pin the realm via the
     -- StarRocks property convention (`iceberg.catalog.x-iceberg-realm`).
@@ -1208,7 +1244,7 @@ PROPERTIES (
     -- POLARIS_REALM_CONTEXT_REALMS) and rejects the request as
     -- wrong-realm -- StarRocks then sees zero tables in the catalog.
     -- Ref: https://polaris.apache.org/docs/configuration/#bootstrapping
-    "iceberg.catalog.x-iceberg-realm" = "default-realm",
+    "iceberg.catalog.header.X-Iceberg-Realm" = "default-realm",
     "aws.s3.endpoint" = "http://minio:9000",
     "aws.s3.enable_ssl" = "false",
     "aws.s3.enable_path_style_access" = "true",
@@ -1253,9 +1289,12 @@ export MSYS2_ARG_CONV_EXCL='*'
 POLARIS_CATALOG_URI="${ICEBERG_REST_URI:-http://localhost:8181/api/catalog}"
 
 echo "[studio-polaris-smoke] checking Polaris..."
-curl -fsS "${POLARIS_CATALOG_URI}/v1/config" >/dev/null \
-  || { echo "polaris unreachable"; exit 1; }
-echo "  polaris OK"
+# Polaris 1.4.x auth-gates /v1/config, so an UNauthenticated probe returns 401 —
+# which still proves Polaris is up and serving. Treat any HTTP response (200 or
+# 401) as reachable; only a connection failure (000) is genuinely unreachable.
+POLARIS_CODE=$(curl -s -o /dev/null -w '%{http_code}' "${POLARIS_CATALOG_URI}/v1/config?warehouse=probe" || echo 000)
+[ "${POLARIS_CODE}" = "000" ] && { echo "polaris unreachable"; exit 1; }
+echo "  polaris OK (HTTP ${POLARIS_CODE})"
 
 echo "[studio-polaris-smoke] checking StarRocks FE..."
 docker exec udp-starrocks-fe mysql -h 127.0.0.1 -P 9030 -u root -e "SELECT 1" >/dev/null \
@@ -1282,6 +1321,9 @@ catalog = os.environ["POLARIS_CATALOG_NAME"]
 spark = (
     SparkSession.builder.appName("lhs-polaris-smoke")
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    # Pin the default catalog to Polaris — the base image bakes `udp`
+    # (Iceberg-REST) as default, which isn't in this stack (UnknownHost).
+    .config("spark.sql.defaultCatalog", catalog)
     .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
     .config(f"spark.sql.catalog.{catalog}.type", "rest")
     .config(f"spark.sql.catalog.{catalog}.uri", os.environ["POLARIS_CATALOG_URI"])
