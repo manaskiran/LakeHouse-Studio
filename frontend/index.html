@@ -4323,8 +4323,12 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const lastSeq = state._wsLastSeq?.[id] || 0;
-    const qs = lastSeq > 0 ? `?last_seq=${lastSeq}` : "";
-    const url = `${proto}://${location.host}/api/installs/${id}/logs${qs}`;
+    const params = new URLSearchParams();
+    if (lastSeq > 0) params.set("last_seq", String(lastSeq));
+    const tok = authToken();
+    if (tok) params.set("token", tok);
+    const qs = params.toString();
+    const url = `${proto}://${location.host}/api/installs/${id}/logs${qs ? "?" + qs : ""}`;
     let ws;
     try {
       ws = new WebSocket(url);
@@ -6155,7 +6159,9 @@ SELECT * FROM app_analytics.demo_customer_summary LIMIT 5;</textarea>
     errEl.classList.add("hidden");
     out.innerHTML = "";
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${location.host}/api/installs/${state.installId}/services/${encodeURIComponent(svc)}/logs/stream`;
+    const svcTok = authToken();
+    const svcQs = svcTok ? `?token=${encodeURIComponent(svcTok)}` : "";
+    const url = `${proto}://${location.host}/api/installs/${state.installId}/services/${encodeURIComponent(svc)}/logs/stream${svcQs}`;
     let ws;
     try { ws = new WebSocket(url); }
     catch (e) { errEl.textContent = `WS open failed: ${e.message}`; errEl.classList.remove("hidden"); return; }
