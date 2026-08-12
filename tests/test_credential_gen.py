@@ -1,4 +1,4 @@
-"""P0.4b — tests for opt-in per-install credential generation.
+"""P0.4b/P0.7 — tests for per-install credential generation (default ON).
 
 Two layers:
   * backend.credential_gen — the pure secret generator + constants
@@ -6,7 +6,9 @@ Two layers:
     replaces the shipped demo secret everywhere it was written
 
 Guarantees:
-  - default OFF: no flag → nothing generated (verified via the pure decision)
+  - default ON since P0.7: with no flag set, the wiring resolves to
+    "generate" (see test_default_is_on_without_any_flag below);
+    LHS_GENERATE_CREDENTIALS=0 opts back out to the old byte-identical path
   - generated secret is strong + quoting-safe
   - the sweep replaces the unique demo literal across text files, skips
     binaries/.git, is idempotent, and never re-serializes YAML
@@ -20,6 +22,25 @@ import pytest
 
 from backend import credential_gen as cg
 from backend import runner
+
+
+# ---------------------------------------------------------------------------
+# P0.7 — default-ON wiring (the actual decision credential-gen's caller
+# makes; see runner.py's env-writing step)
+# ---------------------------------------------------------------------------
+
+
+def test_default_is_on_without_any_flag():
+    """Nothing set anywhere == the new default: generate."""
+    assert runner._resolve_flag([None, None], default=True) is True
+
+
+@pytest.mark.parametrize("off_value", ["0", "false", "no", "off"])
+def test_explicit_opt_out_still_works(off_value):
+    """An operator who wants the old byte-identical demo path can still
+    get it by explicitly disabling the flag."""
+    assert runner._resolve_flag([off_value, None], default=True) is False
+    assert runner._resolve_flag([None, off_value], default=True) is False
 
 
 # ---------------------------------------------------------------------------
