@@ -34,6 +34,7 @@ from . import ai_provisioner as ai_prov
 from . import custom_stack_runner as custom_runner
 from . import stack_composer
 from . import component_registry as comp_reg
+from . import rate_limit
 from .compatibility import (
     list_locks,
     list_upgrade_candidates,
@@ -126,6 +127,83 @@ class V1AliasMiddleware:
 
 
 app.add_middleware(V1AliasMiddleware)
+
+
+# P0.6 — rate limiting (default ON). Pure ASGI so it covers both HTTP and
+# WebSocket connection attempts in one place, same reasoning as
+# V1AliasMiddleware above. See backend/rate_limit.py for the two limits
+# (general flood cap + auth-failure lockout) and how to tune/disable them.
+class RateLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        scope_type = scope.get("type")
+        if scope_type not in ("http", "websocket") or not rate_limit.is_enabled():
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") in rate_limit.EXEMPT_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        key = rate_limit.client_key_from_scope(scope)
+
+        if rate_limit.auth_fail_tracker.is_locked(key):
+            await self._reject(scope, receive, send, scope_type)
+            return
+
+        gen_max = rate_limit._int_env("LHS_RATE_LIMIT_MAX", 300)
+        gen_window = rate_limit._int_env("LHS_RATE_LIMIT_WINDOW", 60)
+        if not rate_limit.limiter.hit(key, gen_max, gen_window):
+            await self._reject(scope, receive, send, scope_type)
+            return
+
+        if scope_type == "http":
+            status_holder: dict = {}
+
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    status_holder["status"] = message["status"]
+                await send(message)
+
+            await self.app(scope, receive, send_wrapper)
+            if status_holder.get("status") == 401:
+                self._record_auth_failure(key)
+        else:
+            # WebSocket: a 4003 close is this app's "unauthorized" signal
+            # from _ws_auth_ok (see the two log-stream routes) — treat it
+            # the same as an HTTP 401 for lockout purposes.
+            async def send_wrapper(message):
+                if message["type"] == "websocket.close" and message.get("code") == 4003:
+                    self._record_auth_failure(key)
+                await send(message)
+
+            await self.app(scope, receive, send_wrapper)
+
+    @staticmethod
+    def _record_auth_failure(key: str) -> None:
+        max_fail = rate_limit._int_env("LHS_RATE_LIMIT_AUTH_FAIL_MAX", 10)
+        window = rate_limit._int_env("LHS_RATE_LIMIT_AUTH_FAIL_WINDOW", 300)
+        cooldown = rate_limit._int_env("LHS_RATE_LIMIT_AUTH_FAIL_COOLDOWN", 300)
+        rate_limit.auth_fail_tracker.record_failure(key, max_fail, window, cooldown)
+
+    @staticmethod
+    async def _reject(scope, receive, send, scope_type: str) -> None:
+        if scope_type == "websocket":
+            # Drain the initial connect event before responding, per the
+            # ASGI websocket protocol, then close without ever accepting.
+            message = await receive()
+            if message.get("type") == "websocket.connect":
+                await send({"type": "websocket.close", "code": 1013})  # "try again later"
+            return
+        response = JSONResponse(
+            {"error": "rate limited — too many requests, slow down"},
+            status_code=429,
+        )
+        await response(scope, receive, send)
+
+
+app.add_middleware(RateLimitMiddleware)
 
 
 FRONTEND_DIR = ROOT / "frontend"

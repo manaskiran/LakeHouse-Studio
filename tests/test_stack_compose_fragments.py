@@ -457,3 +457,54 @@ def test_trino_service_env_uses_compose_interpolation(tmp_path: Path):
     assert "${TRINO_JAVA_OPTS:-" in body
     assert "${TRINO_QUERY_MAX_MEMORY_PER_NODE:-1.5GB}" in body
     assert "${TRINO_QUERY_MAX_MEMORY:-1.5GB}" in body
+
+
+# ---------------------------------------------------------------------------
+# P0.8 — Superset builds a Debian-patched image instead of pulling the
+# stock apache/superset tag directly (Trivy: 583 OS-package CVEs fixable
+# with just an apt-get upgrade layer).
+# ---------------------------------------------------------------------------
+
+def test_superset_service_builds_hardened_image_not_stock_tag(tmp_path: Path):
+    path = scf.write_fragment("startup-analytics-local-v0.1", tmp_path, {})
+    assert path is not None
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    superset = doc["services"]["superset"]
+    assert superset["build"] == {
+        "context": f"./{scf._SUPERSET_BUILD_DIR}",
+        "dockerfile": "Dockerfile",
+    }
+    # A tag is still declared so `docker compose up` reuses the cached
+    # build across runs instead of re-tagging an anonymous image every time.
+    assert superset["image"] == "udp-superset-hardened:4.1.1"
+    assert superset["image"] != scf._SUPERSET_BASE_IMAGE
+
+
+def test_write_fragment_drops_the_superset_dockerfile(tmp_path: Path):
+    path = scf.write_fragment("startup-analytics-local-v0.1", tmp_path, {})
+    assert path is not None
+    dockerfile = tmp_path / scf._SUPERSET_BUILD_DIR / "Dockerfile"
+    assert dockerfile.exists()
+    body = dockerfile.read_text(encoding="utf-8")
+    assert body.startswith(f"# Auto-generated")
+    assert f"FROM {scf._SUPERSET_BASE_IMAGE}" in body
+    assert "apt-get upgrade" in body
+    # Root only for the upgrade step — drop back to the image's normal
+    # unprivileged user before the container ever runs.
+    assert body.rstrip().splitlines()[-1] == "USER superset"
+
+
+def test_superset_dockerfile_only_written_for_startup_analytics(tmp_path: Path):
+    """No other stack pulls in Superset, so no other stack should get a
+    superset-hardened/ build context."""
+    path = scf.write_fragment("udp-local-v0.2", tmp_path, {})
+    assert path is not None
+    assert not (tmp_path / scf._SUPERSET_BUILD_DIR).exists()
+
+
+def test_write_fragment_superset_build_is_idempotent(tmp_path: Path):
+    scf.write_fragment("startup-analytics-local-v0.1", tmp_path, {})
+    scf.write_fragment("startup-analytics-local-v0.1", tmp_path, {})
+    dockerfile = tmp_path / scf._SUPERSET_BUILD_DIR / "Dockerfile"
+    assert dockerfile.exists()
+    assert list((tmp_path / scf._SUPERSET_BUILD_DIR).glob("*.tmp")) == []

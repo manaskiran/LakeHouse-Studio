@@ -844,6 +844,38 @@ _ENV_ALLOW = {
 }
 
 
+_FALSY_STRINGS = {"0", "false", "no", "off", "disable", "disabled"}
+
+
+def _resolve_flag(raw_values: list, default: bool) -> bool:
+    """Merge multiple possible sources (e.g. per-install override + process
+    env) for one boolean flag. An explicit disabling value from ANY source
+    wins over an explicit enabling value from another (safer bias — when
+    in doubt, don't silently turn a feature back on); falls back to
+    `default` only when nothing at all is explicitly set. Used for flags
+    that default ON (opt-out) rather than _is_truthy's default-OFF
+    (opt-in) semantics."""
+    explicit_off = explicit_on = False
+    for v in raw_values:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            explicit_on, explicit_off = (explicit_on or v), (explicit_off or not v)
+            continue
+        s = str(v).strip().lower()
+        if not s:
+            continue
+        if s in _FALSY_STRINGS:
+            explicit_off = True
+        else:
+            explicit_on = True
+    if explicit_off:
+        return False
+    if explicit_on:
+        return True
+    return default
+
+
 def _is_truthy(value: Any) -> bool:
     """Permissive env-flag parser. None/empty/"0"/"false"/"no"/"off" → False;
     everything else (including bare presence) → True."""
@@ -1750,15 +1782,20 @@ class UDPRunner:
             import secrets as _sec
             merged["AIRFLOW_WEBSERVER_SECRET_KEY"] = _sec.token_hex(32)
 
-        # P0.4b — opt-in per-install credential generation (default OFF). When
-        # LHS_GENERATE_CREDENTIALS is set, replace the shipped demo MinIO secret
-        # with a strong random one so no two installs share the public default.
-        # Default path is byte-identical: without the flag nothing is generated
-        # and every consumer resolves to ${MINIO_ROOT_PASSWORD:-udp_admin_12345}.
-        # An explicit operator override always wins over generation.
+        # P0.4b/P0.7 — per-install credential generation, default ON since
+        # P0.7. Unless LHS_GENERATE_CREDENTIALS is explicitly set to a
+        # falsy value (0/false/no/off), replace the shipped demo MinIO
+        # secret with a strong random one so no two installs share the
+        # public default. Explicitly disabling it (e.g. to reproduce the
+        # byte-identical certified demo path) still works via the flag.
+        # An explicit operator override for MINIO_ROOT_PASSWORD always wins
+        # over generation either way.
         self._generated_minio_secret: str | None = None
-        gen_creds = (_is_truthy(merged.get(credential_gen.GENERATE_ENV))
-                     or _is_truthy(os.environ.get(credential_gen.GENERATE_ENV)))
+        gen_creds = _resolve_flag(
+            [merged.get(credential_gen.GENERATE_ENV),
+             os.environ.get(credential_gen.GENERATE_ENV)],
+            default=True,
+        )
         if gen_creds and not clean_overrides.get(credential_gen.MINIO_SECRET_ENV):
             self._generated_minio_secret = credential_gen.generate_secret()
             merged[credential_gen.MINIO_SECRET_ENV] = self._generated_minio_secret

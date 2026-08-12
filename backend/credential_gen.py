@@ -1,16 +1,18 @@
-"""P0.4b — opt-in per-install credential generation (default OFF).
+"""P0.4b/P0.7 — per-install credential generation (default ON since P0.7).
 
 The stacks ship a documented demo/pilot MinIO secret (``udp_admin_12345``) that
-is public in the repo and identical on every install. When an operator opts in
-via ``LHS_GENERATE_CREDENTIALS``, the runner generates a strong random secret and
-rewrites the shipped literal across the install directory so no two installs
-share the known default.
+is public in the repo and identical on every install. By default the runner
+generates a strong random secret and rewrites the shipped literal across the
+install directory so no two installs share the known default. Set
+``LHS_GENERATE_CREDENTIALS=0`` (or false/no/off) to opt back out — e.g. to
+reproduce the original byte-identical certified demo path for a side-by-side
+comparison.
 
 Design constraints that keep this "stable, not compromise":
 
-* **Default OFF.** Without the flag, nothing is generated and every consumer
-  resolves to the ``${MINIO_ROOT_PASSWORD:-udp_admin_12345}`` default exactly as
-  before — the certified install path stays byte-identical.
+* **Default ON, explicit opt-out.** Without the flag, a secret is generated.
+  Set the flag to a falsy value to fall back to the shipped
+  ``${MINIO_ROOT_PASSWORD:-udp_admin_12345}`` default exactly as before.
 * **Rotate the SECRET, not the username.** The access key stays ``admin``. The
   password literal is unique, so a plain string replace across install-dir text
   files is unambiguous and complete; the username ``admin`` is a common word and
