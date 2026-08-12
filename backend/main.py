@@ -233,6 +233,45 @@ async def _require_auth(request: Request,
 AuthDep = Depends(_require_auth)
 
 
+async def _ws_auth_ok(websocket: WebSocket, rbac_route_path: str) -> bool:
+    """Token check for WebSocket log streams, mirroring _require_auth.
+
+    Browsers cannot set an Authorization header on the WS handshake, so the
+    Studio UI passes the token as a `?token=` query param instead (same
+    channel it already uses for `last_seq`). Non-browser clients (tests,
+    curl-based tools) may still use an Authorization header — we accept
+    either. When neither RBAC nor the legacy AUTH_TOKEN is configured this
+    returns True, matching _require_auth's "auth disabled" behavior so
+    local/dev installs are unaffected.
+    """
+    auth_hdr = websocket.headers.get("authorization", "")
+    presented = None
+    if auth_hdr.lower().startswith("bearer "):
+        presented = auth_hdr.split(" ", 1)[1].strip()
+    if not presented:
+        qtok = websocket.query_params.get("token")
+        if qtok:
+            presented = qtok.strip()
+
+    if rbac_mod.is_rbac_enabled():
+        if not presented:
+            return False
+        try:
+            user = await rbac_mod.authenticate(f"Bearer {presented}", None)
+        except Exception:
+            user = None
+        if user is None:
+            return False
+        try:
+            return await rbac_mod.require_permission(user, rbac_route_path, "GET")
+        except Exception:
+            return False
+
+    if not AUTH_TOKEN:
+        return True  # auth disabled
+    return bool(presented) and secrets.compare_digest(presented, AUTH_TOKEN)
+
+
 # Catalog validation on startup. If problems are found we don't crash the
 # app (it can still serve /healthz), but every catalog-dependent route will
 # return 503 with a clear message until the YAML is fixed.
@@ -2668,6 +2707,10 @@ async def ws_logs(websocket: WebSocket, install_id: str):
             await websocket.close(code=1008)
             return
 
+    if not await _ws_auth_ok(websocket, "/api/installs/{install_id}/logs"):
+        await websocket.close(code=4003)  # unauthorized
+        return
+
     await websocket.accept()
     # Sequence-based replay: client may pass ?last_seq=N to resume from N+1.
     # If N is older than buffered history, we send a `reset` event and replay
@@ -2806,26 +2849,12 @@ async def ws_service_logs(websocket: WebSocket, install_id: str, service_name: s
     # Per Gemini v0.5.1 review: when RBAC is on, a logged-in OPERATOR/VIEWER
     # could otherwise tail any install's logs by guessing install_id. Gate
     # the stream on the same Bearer-token permission check as the HTTP route.
-    # No-op when RBAC is off (legacy single-token mode keeps origin-guard
-    # only, matching the existing /logs WS).
-    if rbac_mod.is_rbac_enabled():
-        auth_hdr = websocket.headers.get("authorization", "")
-        user = None
-        if auth_hdr:
-            try:
-                user = await rbac_mod.authenticate(auth_hdr)
-            except Exception:
-                user = None
-        if user is None:
-            await websocket.close(code=4003)  # unauthorized
-            return
-        try:
-            allowed = await rbac_mod.require_permission(user, "/api/installs/{install_id}/logs")
-        except Exception:
-            allowed = False
-        if not allowed:
-            await websocket.close(code=4003)
-            return
+    # Also covers the legacy single-token mode now (P0.5 — this endpoint
+    # previously fell back to origin-guard-only when RBAC was off, same gap
+    # fixed on /logs above).
+    if not await _ws_auth_ok(websocket, "/api/installs/{install_id}/logs"):
+        await websocket.close(code=4003)  # unauthorized
+        return
 
     await websocket.accept()
     try:
