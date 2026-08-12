@@ -265,20 +265,31 @@ All reachable from the success screen and the CLI:
 - **Export as GitOps bundle** — a tarball of `docker-compose.yml` + scrubbed `.env` + scripts + manifest.
 - **Connect downstream tools (destinations)** — add BI destinations (Insyght / Tableau / Looker / Mode / Superset / Metabase / Power BI / custom JDBC) in three modes (**sql_pull** GA, **push_api** preview, **file_drop** stub); provisions a read-only StarRocks user; Fernet-encrypted credentials.
 - **Day-2 controls** — status, re-run smoke, stop, clean (destroy volumes), uninstall & forget.
-- **Ask Studio** — AI assistant grounded on the install's lock file/state/error catalog (needs `ANTHROPIC_API_KEY`).
 
-### 6.8 AI-assisted provisioning & troubleshooting
+### 6.8 AI-assisted provisioning & troubleshooting — REMOVED
 
-Two AI surfaces, both driven via `litellm` (provider-agnostic) / the Anthropic SDK:
-
-- **AI Build / provisioner** (`backend/ai_provisioner.py`, `ai_configurator.py`, `compat_ai.py`) — an "AI Build" path researches compatible versions, generates configs (Trino catalog files, post-start commands, connectivity checks), installs, and verifies. **Security note:** as of this session, all AI-emitted artifacts pass a trust boundary (`backend/ai_safety.py`) before execution (see §7).
-- **Ask Studio assistant** — grounded troubleshooting over the install's lock file, live state, and a known-error catalog.
+Studio previously had two AI surfaces (AI Build/provisioner and the "Ask Studio"
+chat assistant), both driven via `litellm` / the Anthropic SDK, plus a Stack
+Builder feature (pick-your-own-components → AI-generated configs) that also
+depended on the same pipeline. All of it — `ai_provisioner.py`,
+`ai_configurator.py`, `compat_ai.py`, `ai_assistant.py`, `ai_safety.py`,
+`custom_stack_runner.py`, `stack_composer.py`, `component_registry.py`,
+`compose_safety.py`, every `/api/ai*`, `/api/stack-builder/*`,
+`/api/compat-ai/*`, `/api/image-build/*` route, the `litellm`/`anthropic`
+dependencies, and all related frontend UI — was fully removed to eliminate
+the product's dependency on an external LLM provider. The "⚡ Quick Install"
+one-click button on template cards, which had opportunistically routed
+through this AI pipeline even though installing an already-pinned template
+never needed AI, was rewired to call `/api/installs` directly (the same
+certified path "Review →" always used) rather than being removed. See §7's
+RCE-fix note below for historical context on `ai_safety.py` — that whole
+attack surface no longer exists since the code it protected is gone.
 
 ---
 
 ## 7. Security posture (current) & the hardening already done
 
-**Fixed this session — a confirmed remote-code-execution path.** The AI provisioner asked an LLM for a JSON provisioning plan and executed it directly via `shell=True`: `post_start_commands`, `connectivity_checks`, and Trino catalog files all flowed `litellm.completion()` → `json.loads()` → a shell. A prompt injection smuggled through a stack name or component description could run arbitrary host commands.
+**Fixed this session — a confirmed remote-code-execution path.** (Historical — the AI provisioner this fix protected, along with the entire AI/LLM feature set, was later removed entirely; see §6.8. Kept here as a record of the vulnerability and fix.) The AI provisioner asked an LLM for a JSON provisioning plan and executed it directly via `shell=True`: `post_start_commands`, `connectivity_checks`, and Trino catalog files all flowed `litellm.completion()` → `json.loads()` → a shell. A prompt injection smuggled through a stack name or component description could run arbitrary host commands.
 
 **The gate now in place (`backend/ai_safety.py`, 33 tests):**
 - `validate_catalog_filename()` — strict allowlist; blocks path traversal and shell-metacharacter filenames.
@@ -396,8 +407,8 @@ The council converged on one lever: the ceiling is **breadth of evidence and har
 
 **Launch:** `bash run.sh` (macOS/Linux/Git Bash) or `powershell -ExecutionPolicy Bypass -File .\run.ps1` (Windows). Both create `.venv`, `pip install -r requirements.txt`, and start uvicorn on `LHS_HOST:LHS_PORT` (default `127.0.0.1:7878`).
 
-**Runtime deps (15 pins):** fastapi 0.115.5, uvicorn[standard] 0.32.1, pydantic 2.10.3, python-multipart, jinja2, pyyaml, psutil (host inspection), cryptography (Fernet + TLS), psycopg[binary] + pymysql (DB drivers), anthropic + litellm + python-dotenv (AI), click + rich (CLI), typing_extensions. Requires Python 3.11+, Docker, bash + git.
+**Runtime deps (12 pins):** fastapi 0.115.5, uvicorn[standard] 0.32.1, pydantic 2.10.3, python-multipart, jinja2, pyyaml, psutil (host inspection), cryptography (Fernet + TLS), psycopg[binary] + pymysql (DB drivers), click + rich (CLI), typing_extensions. Requires Python 3.11+, Docker, bash + git. (`anthropic` / `litellm` / `python-dotenv` were removed along with the AI feature set — see §6.8.)
 
-**Feature flags (env):** `LHS_RBAC_ENABLED`, `LHS_AUDIT_ENABLED`, `LHS_AUDIT_SCHEDULER_ENABLED`, `LHS_*_ENABLED` (Airflow/Dagster/Superset/observability overlays), `LHS_AUTH_TOKEN`, `LHS_HOST`/`LHS_BIND`/`LHS_PORT`, `ANTHROPIC_API_KEY` / `LITELLM_*`.
+**Feature flags (env):** `LHS_RBAC_ENABLED`, `LHS_AUDIT_ENABLED`, `LHS_AUDIT_SCHEDULER_ENABLED`, `LHS_*_ENABLED` (Airflow/Dagster/Superset/observability overlays), `LHS_AUTH_TOKEN`, `LHS_HOST`/`LHS_BIND`/`LHS_PORT`, `LHS_RATE_LIMIT_ENABLED`, `LHS_GENERATE_CREDENTIALS`.
 
 **Glossary:** *Lock file* — per-stack `stacks/compatibility/<id>.lock.yaml` pinning exact image tags + constraints + evidence. *Candidate / pilot-stable* — certification states; pilot-stable requires ≥1 recorded passing install. *Recommended set* — the cart-facing component marriage for a stack. *Fragment* — an additive `docker-compose.fragment.yml` supplying services the base compose omits. *Override compose* — additive sidecar files (TLS/monitoring/JDBC) the operator runs themselves.

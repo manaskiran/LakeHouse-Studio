@@ -21,7 +21,7 @@ Master map of project knowledge captured across sessions.
 
 - **`backend/runner.py` is FROZEN.** Every new feature must layer on top of the stable install pipeline. Override-file pattern for compose changes (caddy_tls / monitoring / jdbc_extras as examples).
 - **Lock file as moat.** `stacks/compatibility/<stack-id>.lock.yaml` is the source of truth for certified versions. Status flow: candidate → pilot-stable → linux-stable → production. Promotion requires a real install + evidence block append.
-- **Opt-in features default off.** `LHS_RBAC_ENABLED`, `LHS_AUDIT_ENABLED`, `ANTHROPIC_API_KEY` — legacy single-token + no-AI behavior remains the default.
+- **Opt-in features default off.** `LHS_RBAC_ENABLED`, `LHS_AUDIT_ENABLED` — legacy single-token behavior remains the default. (AI/LLM features were removed entirely as of the security cleanup session — no LiteLLM/Anthropic dependency remains in the codebase.)
 - **API versioning via middleware.** OpenAPI surface stays un-versioned (canonical); `/api/v1/*` is an alias that rewrites scope before routing. Future breaking changes land at `/api/v2/`.
 - **Healthz separates warnings from errors** via the `"warning —"` prefix. `errors_count` flips `ok` to false; warnings only surface in the problems list.
 

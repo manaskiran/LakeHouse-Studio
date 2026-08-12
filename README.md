@@ -93,7 +93,6 @@ The server boots on `http://127.0.0.1:7878` by default (`LHS_BIND` + `LHS_PORT` 
 | `LHS_AUDIT_ENABLED` | `false` | Persist audit events to `work/audit.sqlite` |
 | `LHS_AUDIT_SCHEDULER_ENABLED` | `false` | Auto-prune audit rows older than `LHS_AUDIT_RETENTION_DAYS` (default 90) |
 | `LHS_DR_DRILL_ENABLED` | `false` | Periodic backup integrity probe (non-destructive) |
-| `ANTHROPIC_API_KEY` | _(unset)_ | Enables the AI assistant routes (`/api/ai/*`) |
 | `LHS_WORK_DIR` | `./work` | Where installs, state, audit DB, and backups live on disk |
 
 ## API surface

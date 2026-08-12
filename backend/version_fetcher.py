@@ -257,10 +257,9 @@ _reg(
 )
 
 # ── Custom Studio Spark images ─────────────────────────────────────────────────
-# lakehousestudio/spark-hudi and spark-delta are built + pushed by the image
-# build pipeline (backend/image_builder.py). Before any image is pushed,
-# _fetch_dockerhub_tags returns [] (404 → empty handled above) — version
-# picker shows an empty list and a "Build Image" button.
+# lakehousestudio/spark-hudi and spark-delta are pre-built published images.
+# Before a tag is pushed, _fetch_dockerhub_tags returns [] (404 → empty
+# handled above) — the version picker just shows an empty list.
 _reg(
     ["spark-hudi"],
     lambda: _fetch_dockerhub_tags(
